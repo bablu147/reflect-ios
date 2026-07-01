@@ -1,0 +1,14 @@
+# Swift / Xcode
+.build/
+build/
+.swiftpm/
+DerivedData/
+*.xcodeproj/xcuserdata/
+*.xcworkspace/xcuserdata/
+.DS_Store
+
+# CocoaPods (consumer side)
+Pods/
+
+# Adjust SDK reference clone (comparison only — re-clone if needed)
+goalsdk/
