@@ -37,13 +37,17 @@ public class ReflectCore: NSObject {
     // Durable event queue (Adjust-style): persist before send, drain head-first,
     // delete only on 2xx/permanent-4xx, retry with backoff otherwise.
     private static let queueFileName = "reflect_queue.jsonl"
+    private static let privacyTombstoneFileName = "reflect_privacy_suppression_v1.json"
     private static let maxQueue = 1000
     private static let batchSize = 50   // max events per HTTP request (Unity parity)
     private static let baseBackoffMs: Int64 = 1000
     private static let maxBackoffMs: Int64 = 3_600_000
     private static let maxAskInRepolls = 3   // A3: bound server-driven attribution re-polls per session
+    // Raw install-referrer/AdServices values are memory-only and available just
+    // long enough for the immediate online send.
+    private static let transientAttributionTtlMs: Int64 = 30_000
 
-    private enum SendResult { case success, retry, drop }
+    private enum SendResult { case success, retry, drop, cancelled }
 
     private var appKey = ""
     private var companyKey: String?
@@ -71,6 +75,7 @@ public class ReflectCore: NSObject {
     private var dedupMax = 10
     private var seenDedupIds = Set<String>()
     private var dedupOrder = [String]()
+    private let eventStateLock = NSLock()
     private var consentState = "granted"
     private var requireConsent = false
     private var partnerSharing: [String: [String: Any]] = [:]
@@ -93,6 +98,9 @@ public class ReflectCore: NSObject {
     private var sessionId = ""                                  // per-session GUID, on EVERY event
     private var sessionThresholdMs = ReflectCore.sessionGapMs // configurable new-session gap
     private var heartbeatTimer: DispatchSourceTimer?
+    // Serializes session persistence against privacy cleanup. A privacy block is
+    // installed first; cleanup then waits for any winning mutation and erases it.
+    private let sessionStateLock = NSRecursiveLock()
     private var trackingEnabled = true            // false after deleteUserData()/setEnabled(false)
     private var firstInstallMs: Int64 = 0
     // UIKit values snapshotted on the MAIN thread at init (UIKit accessors are
@@ -116,34 +124,112 @@ public class ReflectCore: NSObject {
     private let queue = OperationQueue()
     private var globalProperties: [String: Any] = [:]
     private var partnerParameters: [String: String] = [:]   // forwarded to integration partners
+    private var globalPropertySourceAtMs: [String: Int64] = [:]
+    private var partnerParameterSourceAtMs: [String: Int64] = [:]
 
-    // Persist global properties + partner parameters (Adjust parity): otherwise a dev who
-    // sets them once at launch loses them on cold start → partner-forwarded params
-    // silently vanish on the install/first-session events that matter most for attribution.
-    private func persistGlobalProps() {
-        globalLock.lock(); let snap = globalProperties; globalLock.unlock()
-        if JSONSerialization.isValidJSONObject(snap),
-           let d = try? JSONSerialization.data(withJSONObject: snap),
-           let s = String(data: d, encoding: .utf8) {
-            UserDefaults.standard.set(s, forKey: "reflect_global_props")
+    // Free-form global/partner values remain useful within a running app, but
+    // making them durable would let a suspended app retain arbitrary click
+    // context on disk beyond 90 days. Source-age them in memory and purge every
+    // historical UserDefaults representation.
+    private func ensureParameterValuesAreEphemeral() {
+        AttributionRetention.clearLegacyParameterPersistence()
+    }
+
+    private func restoreParams(
+        nowMs: Int64 = Int64(Date().timeIntervalSince1970 * 1_000)
+    ) {
+        ensureParameterValuesAreEphemeral()
+        // Preserve values set before initialize() and values held across a
+        // same-process disable/enable, while enforcing their original clocks.
+        pruneExpiredEphemeralParameters(nowMs: nowMs)
+    }
+
+    private func pruneExpiredEphemeralParameters(
+        nowMs: Int64 = Int64(Date().timeIntervalSince1970 * 1_000)
+    ) {
+        var globalsChanged = false
+        var partnersChanged = false
+        globalLock.lock()
+        for key in Array(globalProperties.keys) {
+            guard let sourceAtMs = globalPropertySourceAtMs[key],
+                  AttributionRetention.isSourceTimestampRetained(
+                    sourceAtMs: sourceAtMs,
+                    nowMs: nowMs
+                  ) else {
+                globalProperties.removeValue(forKey: key)
+                globalPropertySourceAtMs.removeValue(forKey: key)
+                globalsChanged = true
+                continue
+            }
+        }
+        for key in Array(partnerParameters.keys) {
+            guard let sourceAtMs = partnerParameterSourceAtMs[key],
+                  AttributionRetention.isSourceTimestampRetained(
+                    sourceAtMs: sourceAtMs,
+                    nowMs: nowMs
+                  ) else {
+                partnerParameters.removeValue(forKey: key)
+                partnerParameterSourceAtMs.removeValue(forKey: key)
+                partnersChanged = true
+                continue
+            }
+        }
+        globalLock.unlock()
+        if globalsChanged || partnersChanged {
+            ensureParameterValuesAreEphemeral()
         }
     }
-    private func persistPartnerParams() {
-        globalLock.lock(); let snap = partnerParameters; globalLock.unlock()
-        if let d = try? JSONSerialization.data(withJSONObject: snap),
-           let s = String(data: d, encoding: .utf8) {
-            UserDefaults.standard.set(s, forKey: "reflect_partner_params")
+
+    private func storedAttributionIfAllowed() -> String? {
+        let defaults = UserDefaults.standard
+        guard trackingEnabled,
+              consentState != "denied",
+              !defaults.bool(forKey: "reflect_suppressed") else { return nil }
+        let stored = defaults.string(forKey: "reflect_attribution_json")
+        let expiry = Int64(defaults.integer(forKey: "reflect_attr_click_context_expires_at_ms"))
+        let scrubbed = AttributionRetention.scrubClickId(
+            stored,
+            expiresAtMs: expiry,
+            failClosedWhenExpiryUnknown:
+                defaults.object(forKey: "reflect_attr_click_context_expires_at_ms") == nil
+        )
+        let hasClickId = AttributionRetention.hasClickId(scrubbed)
+        if scrubbed != stored ||
+            (!hasClickId &&
+             defaults.object(forKey: "reflect_attr_click_context_expires_at_ms") != nil) {
+            if let scrubbed {
+                defaults.set(scrubbed, forKey: "reflect_attribution_json")
+            } else {
+                defaults.removeObject(forKey: "reflect_attribution_json")
+            }
+            if !hasClickId {
+                defaults.removeObject(forKey: "reflect_attr_click_context_expires_at_ms")
+            }
         }
+        return scrubbed
     }
-    private func restoreParams() {
-        if let s = UserDefaults.standard.string(forKey: "reflect_global_props"), let d = s.data(using: .utf8),
-           let o = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any] {
-            globalLock.lock(); globalProperties = o; globalLock.unlock()
+
+    /// Apply identity/property collection only while the current privacy posture
+    /// allows it. Once initialized, the mutation linearizes against block().
+    @discardableResult
+    private func mutateMeasurementState(_ action: () -> Void) ->
+        (applied: Bool, permit: PrivacyTransportGate.Permit?) {
+        guard trackingEnabled, consentState != "denied" else { return (false, nil) }
+        let defaults = UserDefaults.standard
+        guard !defaults.bool(forKey: "reflect_suppressed"),
+              defaults.string(forKey: "reflect_consent_state") != "denied" else { return (false, nil) }
+        if !initialized {
+            action()
+            return (true, nil)
         }
-        if let s = UserDefaults.standard.string(forKey: "reflect_partner_params"), let d = s.data(using: .utf8),
-           let o = (try? JSONSerialization.jsonObject(with: d)) as? [String: String] {
-            globalLock.lock(); partnerParameters = o; globalLock.unlock()
+        guard let permit = transportGate.permit() else { return (false, nil) }
+        var applied = false
+        let valid = transportGate.runIfValid(permit) {
+            guard trackingEnabled, consentState != "denied" else { return }
+            action()
+            applied = true
         }
+        return (valid && applied, valid && applied ? permit : nil)
     }
 
     // X1 — durable attribution-critical signals: the deferred deep link + attribution
@@ -155,10 +241,22 @@ public class ReflectCore: NSObject {
     }
     private func retryPendingSignals() {
         if UserDefaults.standard.bool(forKey: "reflect_pending_deferred_dl") {
-            DispatchQueue.global(qos: .utility).async { [weak self] in self?.resolveDeferredDeepLink() }
+            scheduleDeferredDeepLinkResolution()
         }
         if UserDefaults.standard.bool(forKey: "reflect_pending_attr") {
-            DispatchQueue.global(qos: .utility).async { [weak self] in self?.attributionCheck() }
+            scheduleAttributionCheck()
+        }
+    }
+    private func scheduleDeferredDeepLinkResolution() {
+        guard let permit = transportGate.permit() else { return }
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            self?.resolveDeferredDeepLink(permit: permit)
+        }
+    }
+    private func scheduleAttributionCheck() {
+        guard let permit = transportGate.permit() else { return }
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            self?.attributionCheck(permit: permit)
         }
     }
 
@@ -182,6 +280,13 @@ public class ReflectCore: NSObject {
     // Durable event queue state.
     private var eventQueue: [String] = []
     private let queueLock = NSLock()
+    private var transientAttributionPayloads:
+        [String: (payload: String, expiresAtMs: Int64)] = [:]
+    // Authoritative policy for every non-deletion request. It also owns
+    // cancellation of concrete URLSessionTasks that won the start race.
+    private let transportGate = PrivacyTransportGate()
+    private lazy var pendingPrivacyDelete = PendingPrivacyDeleteStore(defaults: .standard)
+    private lazy var privacyTombstone = PrivacySuppressionTombstone(url: privacyTombstoneFileURL())
     private var sending = false
     private var offlineMode = false   // setOfflineMode(true): keep tracking + queuing, but pause sending
     private var localOnly = false     // empty baseUrl ⇒ local DEBUG mode (Unity parity): collect, NEVER network
@@ -203,6 +308,9 @@ public class ReflectCore: NSObject {
 
     public override init() {
         super.init()
+        // Upgrade cleanup must not depend on initialize() being called or on a
+        // permissive privacy posture.
+        AttributionRetention.clearLegacyParameterPersistence()
         queue.maxConcurrentOperationCount = 1
         loadQueue()
     }
@@ -212,8 +320,30 @@ public class ReflectCore: NSObject {
     public func setListener(_ l: ReflectListener?) {
         listener = l
         if let l = l {
-            if let p = pendingDeferredDeepLink { pendingDeferredDeepLink = nil; DispatchQueue.main.async { l.onDeepLink(p) } }
-            if let p = pendingAttribution { pendingAttribution = nil; DispatchQueue.main.async { l.onAttribution(p) } }
+            // Buffered values belong to the current privacy generation. A
+            // deny/delete may win after async scheduling but before the main
+            // queue runs, so delivery must validate the captured permit.
+            let permit = transportGate.permit()
+            if let value = pendingDeferredDeepLink {
+                pendingDeferredDeepLink = nil
+                if let permit = permit {
+                    DispatchQueue.main.async { [weak self] in
+                        guard let self = self, self.transportGate.isValid(permit),
+                              self.listener === l else { return }
+                        l.onDeepLink(value)
+                    }
+                }
+            }
+            if let value = pendingAttribution {
+                pendingAttribution = nil
+                if let permit = permit {
+                    DispatchQueue.main.async { [weak self] in
+                        guard let self = self, self.transportGate.isValid(permit),
+                              self.listener === l else { return }
+                        l.onAttribution(value)
+                    }
+                }
+            }
         }
     }
 
@@ -252,58 +382,137 @@ public class ReflectCore: NSObject {
             handleTrackAdRevenue(args: args, result: result)
         case "setUserId":
             let newId = args?["userId"] as? String
-            // Anonymous → known: emit a _user_alias stitch event (Unity parity).
-            if userId == nil, let nid = newId, !nid.isEmpty {
-                emitJsonEvent("_user_alias", ["user_id_new": nid, "previous_anonymous": installUuid], nil)
+            var alias: [String: Any]?
+            let mutation = mutateMeasurementState {
+                if userId == nil, let nid = newId, !nid.isEmpty {
+                    alias = ["user_id_new": nid, "previous_anonymous": installUuid]
+                }
+                userId = newId
             }
-            userId = newId
+            if let alias = alias, let permit = mutation.permit {
+                emitJsonEvent("_user_alias", alias, nil, acceptedPermit: permit)
+            }
             result(nil)
         case "clearUserId":
             userId = nil
             result(nil)
         case "setUserProperties":
-            if let json = args?["properties"] as? String,
-               let data = json.data(using: .utf8),
-               let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-                userProperties = dict
+            mutateMeasurementState {
+                if let json = args?["properties"] as? String,
+                   let data = json.data(using: .utf8),
+                   let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                    userProperties = dict
+                }
             }
             result(nil)
         case "setGlobalProperty":
-            if let key = args?["key"] as? String, let value = args?["value"] {
-                globalLock.lock()
-                globalProperties[key] = value
-                globalLock.unlock()
-                persistGlobalProps()
+            mutateMeasurementState {
+                if let key = args?["key"] as? String, let value = args?["value"] {
+                    let nowMs = Int64(Date().timeIntervalSince1970 * 1_000)
+                    let retained = AttributionRetention.sanitizeEphemeralParameter(
+                        key: key,
+                        value: value
+                    )
+                    globalLock.lock()
+                    if let retained {
+                        globalProperties[key] = retained
+                        globalPropertySourceAtMs[key] = nowMs
+                    } else {
+                        globalProperties.removeValue(forKey: key)
+                        globalPropertySourceAtMs.removeValue(forKey: key)
+                    }
+                    globalLock.unlock()
+                    ensureParameterValuesAreEphemeral()
+                }
             }
             result(nil)
         case "unsetGlobalProperty":
             if let key = args?["key"] as? String {
                 globalLock.lock()
                 globalProperties.removeValue(forKey: key)
+                globalPropertySourceAtMs.removeValue(forKey: key)
                 globalLock.unlock()
-                persistGlobalProps()
+                ensureParameterValuesAreEphemeral()
             }
             result(nil)
         case "clearGlobalProperties":
             globalLock.lock()
             globalProperties.removeAll()
+            globalPropertySourceAtMs.removeAll()
             globalLock.unlock()
-            persistGlobalProps()
+            ensureParameterValuesAreEphemeral()
             result(nil)
         case "setConsent":
+            let wasDenied = consentState == "denied"
             let granted = args?["granted"] as? Bool ?? true
-            consentState = granted ? "granted" : "denied"
-            if ffCoppa { advertisingConsent = false }              // COPPA always wins
-            else if !granted { advertisingConsent = false }
-            else if !requireAdConsentLatch { advertisingConsent = true }
-            UserDefaults.standard.set(consentState, forKey: "reflect_consent_state")
+            let defaults = UserDefaults.standard
             if granted {
-                DispatchQueue.main.async { [weak self] in self?.refreshAttStatus(); self?.refreshIdfa() }  // re-collect IDFA on grant (gap 5)
-                scheduleDrain(0)   // consent regained → flush held events
+                // A permissive transition requires initialized app/tenant state.
+                // Never let a pre-init call erase a fail-closed tombstone based on
+                // stale wrapper/native state.
+                guard initialized else {
+                    result(ReflectError(
+                        code: "not_initialized",
+                        message: "Consent cannot be granted before initialization.",
+                        details: nil
+                    ))
+                    return
+                }
+                // Relaxation is two-phase: the ordinary store must commit first,
+                // then the independent fail-closed tombstone may be removed. Any
+                // failure restores denial before transport can reopen.
+                defaults.set("granted", forKey: "reflect_consent_state")
+                let defaultsPersisted = defaults.synchronize()
+                let tombstoneCleared = defaultsPersisted
+                    ? privacyTombstone.update(consentDenied: false)
+                    : false
+                guard defaultsPersisted && tombstoneCleared else {
+                    defaults.set("denied", forKey: "reflect_consent_state")
+                    _ = defaults.synchronize()
+                    _ = privacyTombstone.update(consentDenied: true)
+                    consentState = "denied"
+                    advertisingConsent = false
+                    transportGate.block()
+                    clearEventQueue()
+                    clearLocalIdentityForConsentDenial()
+                    result(ReflectError(
+                        code: "privacy_persistence_failed",
+                        message: "Could not durably persist consent state.",
+                        details: nil
+                    ))
+                    return
+                }
+                consentState = "granted"
+                if ffCoppa { advertisingConsent = false }
+                else if !requireAdConsentLatch { advertisingConsent = true }
+                DispatchQueue.main.async { [weak self] in self?.refreshAttStatus(); self?.refreshIdfa() }
+                if trackingEnabled && wasDenied { activateAfterPrivacyGate() }
+                else { scheduleDrain(0) }
+            } else {
+                // Restriction takes effect in memory and destroys local data even
+                // if one persistence backend fails. Either durable store is enough
+                // to keep the next process fail-closed; callers receive an error
+                // only when neither store could record the denial.
+                consentState = "denied"
+                advertisingConsent = false
+                transportGate.block()
+                let tombstonePersisted = privacyTombstone.update(consentDenied: true)
+                defaults.set("denied", forKey: "reflect_consent_state")
+                let defaultsPersisted = defaults.synchronize()
+                clearEventQueue()
+                clearLocalIdentityForConsentDenial()
+                guard tombstonePersisted || defaultsPersisted else {
+                    result(ReflectError(
+                        code: "privacy_persistence_failed",
+                        message: "Could not durably persist consent state.",
+                        details: nil
+                    ))
+                    return
+                }
             }
             result(nil)
         case "setExternalDeviceId":
-            externalDeviceId = args?["externalDeviceId"] as? String
+            mutateMeasurementState { externalDeviceId = args?["externalDeviceId"] as? String }
             result(nil)
         case "setAudience":
             // Audience tags → _set_audience (Unity SetAudience); Flutter routes via trackEvent.
@@ -311,8 +520,17 @@ public class ReflectCore: NSObject {
             result(nil)
         case "setThirdPartySharing":
             if let enabled = args?["enabled"] as? Bool {
-                thirdPartySharing = NSNumber(value: enabled)
                 UserDefaults.standard.set(enabled, forKey: "reflect_third_party_sharing")   // persist (Unity parity)
+                guard UserDefaults.standard.synchronize() else {
+                    if !enabled { thirdPartySharing = NSNumber(value: false) }
+                    result(ReflectError(
+                        code: "privacy_persistence_failed",
+                        message: "Could not durably persist third-party-sharing state.",
+                        details: nil
+                    ))
+                    return
+                }
+                thirdPartySharing = NSNumber(value: enabled)
                 // Authoritative event (Unity parity) so the server records the change.
                 emitJsonEvent("_third_party_sharing", ["enabled": enabled], nil)
             }
@@ -320,46 +538,70 @@ public class ReflectCore: NSObject {
         case "setAdvertisingConsent":
             let g = args?["granted"] as? Bool ?? true
             // COPPA / denied consent hard-block re-enabling ad tracking.
+            let targetAdvertisingConsent: Bool
             if g && (ffCoppa || consentState == "denied") {
                 log("setAdvertisingConsent(true) ignored — blocked by \(ffCoppa ? "COPPA" : "denied consent")")
+                targetAdvertisingConsent = false
+            } else { targetAdvertisingConsent = g }
+            UserDefaults.standard.set(targetAdvertisingConsent, forKey: "reflect_ad_consent")
+            guard UserDefaults.standard.synchronize() else {
                 advertisingConsent = false
-            } else { advertisingConsent = g }
+                result(ReflectError(
+                    code: "privacy_persistence_failed",
+                    message: "Could not durably persist advertising-consent state.",
+                    details: nil
+                ))
+                return
+            }
+            advertisingConsent = targetAdvertisingConsent
             if advertisingConsent {
                 DispatchQueue.main.async { [weak self] in self?.refreshAttStatus(); self?.refreshIdfa() }  // re-collect IDFA on grant (gap 5)
             }
-            UserDefaults.standard.set(advertisingConsent, forKey: "reflect_ad_consent")   // persist (Unity parity)
             result(nil)
         case "setPartnerSharing":
-            if let partner = args?["partner"] as? String, !partner.isEmpty,
-               let key = args?["key"] as? String, !key.isEmpty, let value = args?["value"] {
-                var m = partnerSharing[partner] ?? [:]
-                m[key] = value
-                partnerSharing[partner] = m
-                emitJsonEvent("_third_party_sharing", ["partner_sharing": partnerSharing], nil)
+            var sharingEvent: [String: Any]?
+            let mutation = mutateMeasurementState {
+                if let partner = args?["partner"] as? String, !partner.isEmpty,
+                   let key = args?["key"] as? String, !key.isEmpty, let value = args?["value"] {
+                    var m = partnerSharing[partner] ?? [:]
+                    m[key] = value
+                    partnerSharing[partner] = m
+                    sharingEvent = ["partner_sharing": partnerSharing]
+                }
+            }
+            if let sharingEvent = sharingEvent, let permit = mutation.permit {
+                emitJsonEvent("_third_party_sharing", sharingEvent, nil, acceptedPermit: permit)
             }
             result(nil)
         case "registerPushToken":
             // The token rides the envelope (top-level push_token) on every
             // subsequent event; the server promotes it to a column.
-            pushToken = args?["token"] as? String
-            // ALSO emit a _push_token event (Unity parity) so the server stores
-            // the token immediately, not only when the next event carries it.
-            if let tok = pushToken, !tok.isEmpty {
-                var props: [String: Any] = ["token": tok]
-                if let provider = args?["provider"] as? String, !provider.isEmpty { props["provider"] = provider }
-                emitJsonEvent("_push_token", props, nil)
+            var pushEvent: [String: Any]?
+            let mutation = mutateMeasurementState {
+                pushToken = args?["token"] as? String
+                // ALSO emit a _push_token event (Unity parity) so the server stores
+                // the token immediately, not only when the next event carries it.
+                if let tok = pushToken, !tok.isEmpty {
+                    var props: [String: Any] = ["token": tok]
+                    if let provider = args?["provider"] as? String, !provider.isEmpty { props["provider"] = provider }
+                    pushEvent = props
+                }
+            }
+            if let pushEvent = pushEvent, let permit = mutation.permit {
+                emitJsonEvent("_push_token", pushEvent, nil, acceptedPermit: permit)
             }
             result(nil)
         case "setPushToken":
             // STICKY-ONLY (Unity parity): sets the envelope field, no _push_token event.
-            pushToken = args?["token"] as? String
+            mutateMeasurementState { pushToken = args?["token"] as? String }
             result(nil)
         case "setIntegrityToken":
-            integrityToken = args?["token"] as? String
+            mutateMeasurementState { integrityToken = args?["token"] as? String }
             result(nil)
         case "verifyPurchase":
+            let permit = transportGate.permit()
             DispatchQueue.global(qos: .utility).async { [weak self] in
-                let r = self?.verifyPurchaseHttp(args) ?? ["status": "failed", "code": 0, "message": "request_failed"]
+                let r = self?.verifyPurchaseHttp(args, permit: permit) ?? ["status": "failed", "code": 0, "message": "request_failed"]
                 DispatchQueue.main.async { result(r) }
             }
         case "requestIosTracking":
@@ -373,8 +615,7 @@ public class ReflectCore: NSObject {
         case "getLastDeepLink":
             result(lastDeepLink)   // Unity GetLastDeeplink
         case "getAttribution":
-            let attr = UserDefaults.standard.string(forKey: "reflect_attribution_json")
-            result(attr)
+            result(storedAttributionIfAllowed())
         case "getAttributionWithTimeout":
             // Force a FRESH /attribution/check; return as soon as it resolves or the
             // cached value after the timeout (Unity parity).
@@ -385,19 +626,23 @@ public class ReflectCore: NSObject {
                 if first { DispatchQueue.main.async { result(v) } }
             }
             DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + .milliseconds(timeoutMs)) {
-                reply(UserDefaults.standard.string(forKey: "reflect_attribution_json"))
+                reply(self.storedAttributionIfAllowed())
             }
+            let permit = transportGate.permit()
             DispatchQueue.global(qos: .utility).async { [weak self] in
-                self?.attributionCheck(forceFresh: true)
-                reply(UserDefaults.standard.string(forKey: "reflect_attribution_json"))
+                if let permit = permit { self?.attributionCheck(forceFresh: true, permit: permit) }
+                reply(self?.storedAttributionIfAllowed())
             }
         case "updateConversionValue":
             handleUpdateConversionValue(args: args, result: result)
         case "resolveDeepLink":
             let url = args?["url"] as? String ?? ""
+            let permit = transportGate.permit()
             DispatchQueue.global(qos: .utility).async { [weak self] in
-                let resolved = self?.resolveLink(url)
-                DispatchQueue.main.async { result(resolved) }
+                let resolved = permit.flatMap { self?.resolveLink(url, permit: $0) }
+                DispatchQueue.main.async {
+                    result(permit.flatMap { self?.transportGate.isValid($0) == true ? resolved : nil } ?? nil)
+                }
             }
         case "handleDeepLink":
             // App-driven deep-link injection (Unity HandleDeepLink): route a URL the
@@ -409,25 +654,53 @@ public class ReflectCore: NSObject {
         case "deleteUserData":
             handleDeleteUserData(result: result)
         case "setEnabled":
-            setTrackingEnabled(args?["enabled"] as? Bool ?? true)
-            result(nil)
+            if setTrackingEnabled(args?["enabled"] as? Bool ?? true) {
+                result(nil)
+            } else {
+                result(ReflectError(
+                    code: "privacy_persistence_failed",
+                    message: "Could not durably persist tracking suppression.",
+                    details: nil
+                ))
+            }
         case "isEnabled":
             result(trackingEnabled)
         case "setPartnerParameter":
             let key = args?["key"] as? String ?? ""
-            if !key.isEmpty, let value = args?["value"] as? String {
-                globalLock.lock(); partnerParameters[key] = value; globalLock.unlock()
-                persistPartnerParams()
+            mutateMeasurementState {
+                if !key.isEmpty, let value = args?["value"] as? String {
+                    let nowMs = Int64(Date().timeIntervalSince1970 * 1_000)
+                    let retained = AttributionRetention.sanitizeEphemeralParameter(
+                        key: key,
+                        value: value
+                    ) as? String
+                    globalLock.lock()
+                    if let retained {
+                        partnerParameters[key] = retained
+                        partnerParameterSourceAtMs[key] = nowMs
+                    } else {
+                        partnerParameters.removeValue(forKey: key)
+                        partnerParameterSourceAtMs.removeValue(forKey: key)
+                    }
+                    globalLock.unlock()
+                    ensureParameterValuesAreEphemeral()
+                }
             }
             result(nil)
         case "unsetPartnerParameter":
             let key = args?["key"] as? String ?? ""
-            globalLock.lock(); partnerParameters.removeValue(forKey: key); globalLock.unlock()
-            persistPartnerParams()
+            globalLock.lock()
+            partnerParameters.removeValue(forKey: key)
+            partnerParameterSourceAtMs.removeValue(forKey: key)
+            globalLock.unlock()
+            ensureParameterValuesAreEphemeral()
             result(nil)
         case "clearPartnerParameters":
-            globalLock.lock(); partnerParameters.removeAll(); globalLock.unlock()
-            persistPartnerParams()
+            globalLock.lock()
+            partnerParameters.removeAll()
+            partnerParameterSourceAtMs.removeAll()
+            globalLock.unlock()
+            ensureParameterValuesAreEphemeral()
             result(nil)
         case "flush":
             scheduleDrain(0)
@@ -475,36 +748,61 @@ public class ReflectCore: NSObject {
         if let url = args?["baseUrl"] as? String { baseUrl = url }
         localOnly = baseUrl.isEmpty
 
+        let defaults = UserDefaults.standard
         if args?["requireAdvertisingConsent"] as? Bool == true {
             requireAdConsentLatch = true
-            advertisingConsent = false
         }
         requireConsent = args?["requireConsent"] as? Bool == true
-        // Consent posture (Unity parity): a PERSISTED state wins; else explicit
-        // initialConsent; else fail-closed ("denied") when requireConsent. Applied
-        // BEFORE install/open fire so a CMP-gated app never leaks ids on event 1.
+        let durablePrivacy = privacyTombstone.read()
+        // A denial in either store wins. Unity writes its mirror before an
+        // opt-out dispatch and relaxes it only after native acknowledgement.
         let ic = args?["initialConsent"] as? String
-        if UserDefaults.standard.object(forKey: "reflect_consent_state") != nil {
-            consentState = UserDefaults.standard.string(forKey: "reflect_consent_state") ?? "granted"
-        } else if ic == "denied" || ic == "granted" {
-            consentState = ic!
-        } else if requireConsent {
-            consentState = "denied"
+        let storedConsent = defaults.string(forKey: "reflect_consent_state")
+        consentState = InitialPrivacyPosture.resolveConsent(
+            stored: storedConsent,
+            initial: ic,
+            requireConsent: requireConsent,
+            durableConsentDenied: durablePrivacy.consentDenied
+        )
+        if ic == "denied", storedConsent != "denied" {
+            defaults.set("denied", forKey: "reflect_consent_state")
         }
-        if consentState == "denied" { advertisingConsent = false }
-        if ffCoppa { advertisingConsent = false }   // COPPA hard-gate
-        // Restore persisted opt-outs across relaunch (Unity parity): only AND-IN a stored
-        // ad-consent=false (never force it back true — COPPA/denied/requireAdConsent win).
-        if UserDefaults.standard.object(forKey: "reflect_ad_consent") != nil,
-           !UserDefaults.standard.bool(forKey: "reflect_ad_consent") { advertisingConsent = false }
-        if UserDefaults.standard.object(forKey: "reflect_third_party_sharing") != nil {
-            thirdPartySharing = NSNumber(value: UserDefaults.standard.bool(forKey: "reflect_third_party_sharing"))
+        func storedBool(_ key: String) -> Bool? {
+            defaults.object(forKey: key) == nil ? nil : defaults.bool(forKey: key)
         }
-        // COPPA hard-gate (Adjust parity): a child-directed app must NEVER share with
-        // partners — force off regardless of any stored/default. (Was a defect: COPPA
-        // apps still transmitted third_party_sharing=true.)
-        if ffCoppa { thirdPartySharing = NSNumber(value: false) }
-        restoreParams()   // reload persisted global/partner params BEFORE the install/first-session events emit
+        let storedSuppression = storedBool("reflect_suppressed")
+        let storedAdConsent = storedBool("reflect_ad_consent")
+        let storedThirdPartySharing = storedBool("reflect_third_party_sharing")
+        let initialEnabled = args?["initialEnabled"] as? Bool
+        let initialAdConsent = args?["initialAdvertisingConsent"] as? Bool
+        let initialThirdPartySharing = args?["initialThirdPartySharing"] as? Bool
+        let posture = InitialPrivacyPosture.resolve(
+            storedSuppression: storedSuppression,
+            storedAdvertisingConsent: storedAdConsent,
+            storedThirdPartySharing: storedThirdPartySharing,
+            initialEnabled: initialEnabled,
+            initialAdvertisingConsent: initialAdConsent,
+            initialThirdPartySharing: initialThirdPartySharing,
+            advertisingHardBlocked: requireAdConsentLatch || consentState == "denied" || ffCoppa,
+            coppa: ffCoppa,
+            durableTrackingSuppressed: durablePrivacy.trackingSuppressed
+        )
+        trackingEnabled = posture.trackingEnabled
+        advertisingConsent = posture.advertisingConsent
+        thirdPartySharing = posture.thirdPartySharing.map { NSNumber(value: $0) }
+        if initialEnabled == false || (storedSuppression == nil && initialEnabled != nil) {
+            defaults.set(!trackingEnabled, forKey: "reflect_suppressed")
+        }
+        if initialAdConsent == false || (storedAdConsent == nil && initialAdConsent != nil) {
+            defaults.set(advertisingConsent, forKey: "reflect_ad_consent")
+        }
+        if initialThirdPartySharing == false ||
+           (storedThirdPartySharing == nil && initialThirdPartySharing != nil) {
+            defaults.set(thirdPartySharing?.boolValue ?? false, forKey: "reflect_third_party_sharing")
+        }
+        // Purge legacy durable parameter stores before install/first-session
+        // events, while preserving values set earlier in this process.
+        restoreParams()
 
         // Snapshot main-thread-only UIKit values now (handleInitialize runs on
         // the platform/main thread), so buildDevice never touches UIKit off-thread.
@@ -512,17 +810,37 @@ public class ReflectCore: NSObject {
         snapshotUIKit()
         registerForegroundObservers()
 
-        let defaults = UserDefaults.standard
-        trackingEnabled = !defaults.bool(forKey: "reflect_suppressed")
         initialized = true
+
+        // A privacy-delete retry is the sole request allowed while analytics
+        // transport is suppressed. Start it before either early return.
+        if !pendingPrivacyDelete.allIntents().isEmpty {
+            DispatchQueue.global(qos: .utility).async { [weak self] in self?.retryPendingDelete() }
+        }
 
         if !trackingEnabled {
             // A prior deleteUserData()/setEnabled(false) latched suppression — stay
             // fully silent (no identity, install, session, or events) until re-enabled.
+            transportGate.block()
+            clearEventQueue()
+            if !pendingPrivacyDelete.allIntents().isEmpty {
+                clearLocalIdentityForConsentDenial(includePrivacyChoices: true)
+            } else if consentState == "denied" {
+                clearLocalIdentityForConsentDenial()
+            }
             log("Initialized in suppressed state — tracking off until re-enabled")
             result(nil)
             return
         }
+        if consentState == "denied" {
+            transportGate.block()
+            clearEventQueue()
+            clearLocalIdentityForConsentDenial()
+            log("Initialized with consent denied — no identity or transport")
+            result(nil)
+            return
+        }
+        transportGate.allow()
         // Adopt a legacy install identity BEFORE minting one, so an upgrade from a
         // wrapper's old store keeps the same install_uuid (+ doesn't re-fire app_install
         // — a legacy install with a uuid already reported it).
@@ -555,8 +873,10 @@ public class ReflectCore: NSObject {
         // so recover any session a prior process left open, then open this launch's.
         // Gated on autoSessionTracking (Unity parity) so a host can take manual control.
         if autoSessionTracking {
+            let sessionPermit = transportGate.permit()
             queue.addOperation { [weak self] in
-                guard let self = self else { return }
+                guard let self = self, let sessionPermit = sessionPermit else { return }
+                self.sessionMutation(sessionPermit) {
                 self.sessionCount = Int64(defaults.integer(forKey: "reflect_session_count"))
                 self.sessionActiveMs = Int64(defaults.integer(forKey: "reflect_session_active_ms"))
                 self.subsessionCount = Int64(defaults.integer(forKey: "reflect_subsession_count"))
@@ -570,11 +890,13 @@ public class ReflectCore: NSObject {
                 // Backward-clock ("time travel") guard (Adjust parity): a device whose
                 // wall-clock rolled back since last activity is a fraud/accuracy signal.
                 if lastWall > 0 && rawGap < 0 {
-                    self.trackEventInternal(eventName: "_clock_skew", propertiesJson: "{\"skew_ms\":\(rawGap)}", referral: nil)
+                    self.trackEventInternal(eventName: "_clock_skew", propertiesJson: "{\"skew_ms\":\(rawGap)}",
+                                            referral: nil, acceptedPermit: sessionPermit)
                 }
                 let crossKillGap: Int64 = lastWall > 0 ? max(0, rawGap) : -1
-                self.recoverInterruptedSession(crossKillGap)
-                self.onForeground(crossKillGap)
+                self.recoverInterruptedSession(crossKillGap, permit: sessionPermit)
+                self.onForeground(crossKillGap, permit: sessionPermit)
+                }
             }
         }
 
@@ -599,15 +921,14 @@ public class ReflectCore: NSObject {
 
         if firstLaunch {
             if autoResolveDeferred {
-                DispatchQueue.global(qos: .utility).async { [weak self] in self?.resolveDeferredDeepLink() }
+                scheduleDeferredDeepLinkResolution()
             }
         } else if autoResolveDeferred && defaults.bool(forKey: "reflect_pending_deferred_dl") {
             // X1: a deferred deep link that was offline at first launch stays pending;
             // re-attempt it on any later launch (attribution already re-runs per session).
-            DispatchQueue.global(qos: .utility).async { [weak self] in self?.resolveDeferredDeepLink() }
+            scheduleDeferredDeepLinkResolution()
         }
-        DispatchQueue.global(qos: .utility).async { [weak self] in self?.attributionCheck() }
-        DispatchQueue.global(qos: .utility).async { [weak self] in self?.retryPendingDelete() }  // GDPR durability
+        scheduleAttributionCheck()
 
         // Auto-ATT (Unity AutoRequestIosTracking): present the prompt at init when opted
         // in (defaults off — the host normally controls prompt timing).
@@ -735,11 +1056,13 @@ public class ReflectCore: NSObject {
     }
 
     private func emitJsonEvent(_ name: String, _ props: [String: Any], _ topLevel: [String: Any]?,
-                               deduplicationId: String? = nil) {
+                               deduplicationId: String? = nil,
+                               acceptedPermit: PrivacyTransportGate.Permit? = nil) {
         if let data = try? JSONSerialization.data(withJSONObject: props),
            let json = String(data: data, encoding: .utf8) {
             trackEventInternal(eventName: name, propertiesJson: json, referral: nil,
-                               topLevel: topLevel, deduplicationId: deduplicationId)
+                               topLevel: topLevel, deduplicationId: deduplicationId,
+                               acceptedPermit: acceptedPermit)
         }
     }
 
@@ -768,12 +1091,18 @@ public class ReflectCore: NSObject {
     /// initial conversion value of 0 (Unity parity). Called ONCE on first launch
     /// (re-arming later would reset a real CV). Silent — emits no `_skan_cv`.
     private func armSkan() {
-        if #available(iOS 16.1, *) {
-            SKAdNetwork.updatePostbackConversionValue(0, coarseValue: .low, lockWindow: false) { _ in }
-        } else if #available(iOS 15.4, *) {
-            SKAdNetwork.updatePostbackConversionValue(0) { _ in }
-        } else if #available(iOS 14.0, *) {
-            SKAdNetwork.registerAppForAdNetworkAttribution()
+        guard trackingEnabled, consentState != "denied",
+              !UserDefaults.standard.bool(forKey: "reflect_suppressed"),
+              let permit = transportGate.permit() else { return }
+        _ = transportGate.runIfValid(permit) {
+            guard trackingEnabled, consentState != "denied" else { return }
+            if #available(iOS 16.1, *) {
+                SKAdNetwork.updatePostbackConversionValue(0, coarseValue: .low, lockWindow: false) { _ in }
+            } else if #available(iOS 15.4, *) {
+                SKAdNetwork.updatePostbackConversionValue(0) { _ in }
+            } else if #available(iOS 14.0, *) {
+                SKAdNetwork.registerAppForAdNetworkAttribution()
+            }
         }
     }
 
@@ -789,38 +1118,83 @@ public class ReflectCore: NSObject {
         if fineValue < 0 || fineValue > 63 {   // SKAdNetwork fine value range
             result(["success": false, "error": "fine_value_out_of_range"]); return
         }
+        guard trackingEnabled, consentState != "denied",
+              !UserDefaults.standard.bool(forKey: "reflect_suppressed"),
+              let permit = transportGate.permit() else {
+            result("{\"success\":false,\"error\":\"measurement_disabled\"}")
+            return
+        }
 
         if #available(iOS 16.1, *) {
             var coarse: SKAdNetwork.CoarseConversionValue = .low
             if coarseValue == "medium" { coarse = .medium }
             else if coarseValue == "high" { coarse = .high }
-            SKAdNetwork.updatePostbackConversionValue(fineValue, coarseValue: coarse, lockWindow: lockWindow) { [weak self] error in
-                if let error = error {
-                    result("{\"success\":false,\"error\":\"\(error.localizedDescription)\"}")
-                } else {
-                    self?.reportSkanCv(fineValue, coarseValue, lockWindow, "SKAdNetwork4")
-                    result("{\"success\":true,\"method\":\"SKAdNetwork4\"}")
+            var invoked = false
+            let valid = transportGate.runIfValid(permit) {
+                guard trackingEnabled, consentState != "denied" else { return }
+                invoked = true
+                SKAdNetwork.updatePostbackConversionValue(fineValue, coarseValue: coarse, lockWindow: lockWindow) { [weak self] error in
+                    // Never re-enter the non-recursive privacy lock from a system
+                    // callback that could theoretically be delivered synchronously.
+                    DispatchQueue.main.async {
+                        guard let self = self, self.transportGate.isValid(permit) else {
+                            result("{\"success\":false,\"error\":\"privacy_state_changed\"}")
+                            return
+                        }
+                        if let error = error {
+                            result("{\"success\":false,\"error\":\"\(error.localizedDescription)\"}")
+                        } else {
+                            self.reportSkanCv(fineValue, coarseValue, lockWindow, "SKAdNetwork4", permit: permit)
+                            result("{\"success\":true,\"method\":\"SKAdNetwork4\"}")
+                        }
+                    }
                 }
+            }
+            if !valid || !invoked {
+                result("{\"success\":false,\"error\":\"privacy_state_changed\"}")
             }
             return
         }
 
         if #available(iOS 15.4, *) {
-            SKAdNetwork.updatePostbackConversionValue(fineValue) { [weak self] error in
-                if let error = error {
-                    result("{\"success\":false,\"error\":\"\(error.localizedDescription)\"}")
-                } else {
-                    self?.reportSkanCv(fineValue, coarseValue, lockWindow, "SKAdNetwork3")
-                    result("{\"success\":true,\"method\":\"SKAdNetwork3\"}")
+            var invoked = false
+            let valid = transportGate.runIfValid(permit) {
+                guard trackingEnabled, consentState != "denied" else { return }
+                invoked = true
+                SKAdNetwork.updatePostbackConversionValue(fineValue) { [weak self] error in
+                    DispatchQueue.main.async {
+                        guard let self = self, self.transportGate.isValid(permit) else {
+                            result("{\"success\":false,\"error\":\"privacy_state_changed\"}")
+                            return
+                        }
+                        if let error = error {
+                            result("{\"success\":false,\"error\":\"\(error.localizedDescription)\"}")
+                        } else {
+                            self.reportSkanCv(fineValue, coarseValue, lockWindow, "SKAdNetwork3", permit: permit)
+                            result("{\"success\":true,\"method\":\"SKAdNetwork3\"}")
+                        }
+                    }
                 }
+            }
+            if !valid || !invoked {
+                result("{\"success\":false,\"error\":\"privacy_state_changed\"}")
             }
             return
         }
 
         if #available(iOS 14.0, *) {
-            SKAdNetwork.registerAppForAdNetworkAttribution()
-            SKAdNetwork.updateConversionValue(fineValue)
-            reportSkanCv(fineValue, coarseValue, lockWindow, "SKAdNetwork2")
+            var invoked = false
+            let valid = transportGate.runIfValid(permit) {
+                guard trackingEnabled, consentState != "denied" else { return }
+                invoked = true
+                SKAdNetwork.registerAppForAdNetworkAttribution()
+                SKAdNetwork.updateConversionValue(fineValue)
+            }
+            guard valid, invoked, transportGate.isValid(permit) else {
+                result("{\"success\":false,\"error\":\"privacy_state_changed\"}")
+                return
+            }
+            reportSkanCv(fineValue, coarseValue, lockWindow, "SKAdNetwork2", permit: permit)
             result("{\"success\":true,\"method\":\"SKAdNetwork2\"}")
             return
         }
@@ -832,14 +1206,20 @@ public class ReflectCore: NSObject {
     /// `_skan_cv` event (rides the normal signed /event path). Lets the server do
     /// first-party CV tracking + reconcile with Apple's eventual SKAN postback —
     /// previously the CV update was applied locally and never reached the server.
-    private func reportSkanCv(_ fineValue: Int, _ coarseValue: String?, _ lockWindow: Bool, _ method: String) {
+    private func reportSkanCv(
+        _ fineValue: Int,
+        _ coarseValue: String?,
+        _ lockWindow: Bool,
+        _ method: String,
+        permit: PrivacyTransportGate.Permit
+    ) {
         var props: [String: Any] = [
             "conversion_value": fineValue,
             "lock_window": lockWindow,
             "skan_version": method,
         ]
         if let c = coarseValue, !c.isEmpty { props["coarse_value"] = c }
-        emitJsonEvent("_skan_cv", props, nil)
+        emitJsonEvent("_skan_cv", props, nil, acceptedPermit: permit)
     }
 
     // MARK: - Inbound deep links (direct custom-scheme + Universal Links)
@@ -851,7 +1231,11 @@ public class ReflectCore: NSObject {
     /// Push an incoming URL to the host: warm launch → onDeepLink stream; also
     /// persisted so a cold-launch getInitialDeepLink returns it.
     public func handleIncomingURL(_ url: URL) {
-        UserDefaults.standard.set(url.absoluteString, forKey: "reflect_launch_url")
+        handleIncomingURL(url, acceptedPermit: nil)
+    }
+
+    /// Route privacy-sensitive LinkMe input only in the generation that read it.
+    private func handleIncomingURL(_ url: URL, acceptedPermit: PrivacyTransportGate.Permit?) {
         var params: [String: String] = [:]
         if let comps = URLComponents(url: url, resolvingAgainstBaseURL: false), let q = comps.queryItems {
             for item in q { params[item.name] = item.value ?? "" }
@@ -860,41 +1244,80 @@ public class ReflectCore: NSObject {
         if let c = params["click_id"] { map["clickId"] = c }
         if let c = params["campaign"] { map["campaign"] = c }
         if let p = params["partner"]  { map["partner"]  = p }
-        lastDeepLink = url.absoluteString   // GetLastDeeplink accessor (Unity parity)
-        emitDeepLink(map)
-        reportDeepLinkOpened(url.absoluteString, params)
+        var reportProps: [String: Any]?
+        let mutation: (applied: Bool, permit: PrivacyTransportGate.Permit?)
+        if let acceptedPermit = acceptedPermit {
+            var applied = false
+            let valid = transportGate.runIfValid(acceptedPermit) {
+                guard trackingEnabled, consentState != "denied" else { return }
+                let retainedURL = AttributionRetention.urlWithoutQueryOrFragment(url.absoluteString)
+                UserDefaults.standard.set(retainedURL, forKey: "reflect_launch_url")
+                lastDeepLink = retainedURL
+                if retainedURL != lastDeepLinkReported {
+                    lastDeepLinkReported = retainedURL
+                    reportProps = deepLinkOpenedProperties(url.absoluteString, params, "direct")
+                }
+                applied = true
+            }
+            mutation = (valid && applied, valid && applied ? acceptedPermit : nil)
+        } else {
+            mutation = mutateMeasurementState {
+                let retainedURL = AttributionRetention.urlWithoutQueryOrFragment(url.absoluteString)
+                UserDefaults.standard.set(retainedURL, forKey: "reflect_launch_url")
+                lastDeepLink = retainedURL   // GetLastDeeplink accessor (Unity parity)
+                if retainedURL != lastDeepLinkReported {
+                    lastDeepLinkReported = retainedURL
+                    reportProps = deepLinkOpenedProperties(url.absoluteString, params, "direct")
+                }
+            }
+        }
+        guard mutation.applied else { return }
+        emitDeepLink(map, acceptedPermit: mutation.permit)
+        if let reportProps = reportProps {
+            emitJsonEvent("deep_link_opened", reportProps, nil, acceptedPermit: mutation.permit)
+        }
+    }
+
+    private func deepLinkOpenedProperties(_ url: String, _ params: [String: String], _ source: String) -> [String: Any] {
+        var props: [String: Any] = [
+            "url": AttributionRetention.urlWithoutQueryOrFragment(url),
+            "source": source,
+        ]
+        if let p = URL(string: url)?.path, !p.isEmpty { props["path"] = p }
+        let hasTracking =
+            AttributionRetention.hasUniqueClickContext(params) ||
+            params["campaign"]?.isEmpty == false ||
+            params["partner"]?.isEmpty == false
+        if hasTracking { props["is_reattribution"] = true }
+        return props
     }
 
     /// Emit a `deep_link_opened` event for server-side reattribution / deep-link
     /// conversion (mirrors Unity). is_reattribution when the link carries tracking
     /// params. Deduped per URL so it fires at most once.
     private func reportDeepLinkOpened(_ url: String, _ params: [String: String], _ source: String = "direct") {
-        if url == lastDeepLinkReported { return }
-        lastDeepLinkReported = url
-        var props: [String: Any] = ["url": url, "source": source]   // direct / deferred (Unity parity)
-        if let p = URL(string: url)?.path, !p.isEmpty { props["path"] = p }
-        var hasTracking = false
-        for (k, v) in params where !v.isEmpty {
-            // Forward ALL query params as dl_<key> (key capped 30 chars), Unity parity.
-            let key = k.count > 30 ? String(k.prefix(30)) : k
-            props["dl_" + key] = v
-            if k == "click_id" || k == "campaign" || k == "partner" { hasTracking = true }
+        guard let permit = transportGate.permit() else { return }
+        var props: [String: Any]?
+        guard transportGate.runIfValid(permit, {
+            let reportKey = AttributionRetention.urlWithoutQueryOrFragment(url)
+            guard reportKey != lastDeepLinkReported else { return }
+            lastDeepLinkReported = reportKey
+            props = deepLinkOpenedProperties(url, params, source)
+        }) else { return }
+        if let props = props {
+            emitJsonEvent("deep_link_opened", props, nil, acceptedPermit: permit)
         }
-        if let c = params["click_id"] { props["click_id"] = c }
-        if let c = params["campaign"] { props["campaign"] = c }
-        if let p = params["partner"]  { props["partner"]  = p }
-        if hasTracking { props["is_reattribution"] = true }
-        emitJsonEvent("deep_link_opened", props, nil)
     }
 
     /// Resolve/unshorten a tracking URL via /deeplink/resolve (client parity with
     /// Unity's ResolveDeepLink; server url-resolve handling is a shared gap).
-    private func resolveLink(_ url: String) -> String? {
+    private func resolveLink(_ url: String, permit: PrivacyTransportGate.Permit) -> String? {
+        guard trackingEnabled, consentState != "denied", transportGate.isValid(permit) else { return nil }
         let bodyDict: [String: Any] = ["app_key": appKey, "install_uuid": installUuid, "url": url]
         guard let bodyData = try? JSONSerialization.data(withJSONObject: bodyDict),
               let bodyStr = String(data: bodyData, encoding: .utf8) else { return nil }
         let sig = (signingSecret?.isEmpty == false) ? hmacHex(bodyStr, signingSecret!) : nil
-        guard let resp = httpJson("\(baseUrl)/deeplink/resolve", "POST", bodyStr, sig),
+        guard let resp = httpJson("\(baseUrl)/deeplink/resolve", "POST", bodyStr, sig, permit: permit),
               let data = resp.data(using: .utf8),
               let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return nil }
         return (obj["resolved_url"] as? String) ?? (obj["deep_link_path"] as? String)
@@ -903,16 +1326,36 @@ public class ReflectCore: NSObject {
     /// LinkMe (opt-in): if the pasteboard holds an http(s) URL on first launch,
     /// route it as a deferred deep link (improves iOS deferred match). Unity parity.
     private func linkMeRecover() {
-        if consentState == "denied" { return }   // GDPR: no clipboard read / network under denied consent
-        if !linkMeEnabled { return }
-        guard let text = UIPasteboard.general.string,
-              text.hasPrefix("http://") || text.hasPrefix("https://"),
-              let url = URL(string: text) else { return }
-        DispatchQueue.main.async { [weak self] in self?.handleIncomingURL(url) }
+        guard let permit = transportGate.permit() else { return }
+        // UIKit pasteboard access belongs on the main thread. The read itself is
+        // linearized with deny/delete, and routing keeps the same generation so
+        // a quick deny/re-enable cannot resurrect text captured before the boundary.
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            var recoveredURL: URL?
+            let readAllowed = self.transportGate.runIfValid(permit) {
+                guard self.trackingEnabled, self.consentState != "denied", self.linkMeEnabled,
+                      let text = UIPasteboard.general.string,
+                      text.hasPrefix("http://") || text.hasPrefix("https://") else { return }
+                recoveredURL = URL(string: text)
+            }
+            guard readAllowed, let url = recoveredURL else { return }
+            self.handleIncomingURL(url, acceptedPermit: permit)
+        }
     }
 
     private func handleGetInitialDeepLink(result: ReflectResult) {
-        guard let urlString = UserDefaults.standard.string(forKey: "reflect_launch_url"),
+        let defaults = UserDefaults.standard
+        guard let storedURL = defaults.string(forKey: "reflect_launch_url") else {
+            result(nil)
+            return
+        }
+        // Upgrade legacy cold-launch state fail closed before exposing it.
+        let urlString = AttributionRetention.urlWithoutQueryOrFragment(storedURL)
+        if urlString != storedURL {
+            defaults.set(urlString, forKey: "reflect_launch_url")
+        }
+        guard
               let url = URL(string: urlString) else {
             result(nil)
             return
@@ -931,79 +1374,251 @@ public class ReflectCore: NSObject {
         if let c = params["campaign"] { dl["campaign"] = c }
         if let p = params["partner"]  { dl["partner"] = p }
         reportDeepLinkOpened(url.absoluteString, params)
-        UserDefaults.standard.removeObject(forKey: "reflect_launch_url")   // consume once
+        defaults.removeObject(forKey: "reflect_launch_url")   // consume once
         if let data = try? JSONSerialization.data(withJSONObject: dl),
            let json = String(data: data, encoding: .utf8) {
             result(json)
         } else { result(nil) }
     }
 
-    private func handleDeleteUserData(result: @escaping ReflectResult) {
-        queue.addOperation { [weak self] in
-            guard let self = self else { result(false); return }
-            let uuidToDelete = self.installUuid
-            let uid = self.userId
-            // Forget-me LATCH first + persist the pending-delete uuid (survives, so an
-            // unconfirmed delete is retried on next launch — Unity parity).
-            let d = UserDefaults.standard
-            d.removeObject(forKey: "reflect_install_uuid")
-            d.removeObject(forKey: "reflect_attribution_json")
-            d.removeObject(forKey: "reflect_session_open")
-            d.removeObject(forKey: "reflect_global_props")
-            d.removeObject(forKey: "reflect_partner_params")
-            d.set(true, forKey: "reflect_suppressed")
-            d.set(uuidToDelete, forKey: "reflect_pending_delete")
-            self.trackingEnabled = false
-            self.installUuid = ""
-            self.sessionOpen = false
-            self.userId = nil
-            self.userProperties = nil
-            self.pushToken = nil
-            self.externalDeviceId = nil
-            self.globalLock.lock()
-            self.globalProperties.removeAll()
-            self.partnerParameters.removeAll()
-            self.globalLock.unlock()
-            // Send the SIGNED delete; clear the pending marker only on success.
-            self.sendPrivacyDelete(uuidToDelete, uid) { ok in
-                if ok { UserDefaults.standard.removeObject(forKey: "reflect_pending_delete") }
-                DispatchQueue.main.async { result(ok) }
-            }
+    private func clearEventQueue() {
+        queueLock.lock()
+        eventQueue.removeAll()
+        transientAttributionPayloads.removeAll()
+        let url = queueFileURL()
+        if let url = url {
+            try? FileManager.default.removeItem(at: url)
+            try? FileManager.default.removeItem(at: url.appendingPathExtension("tmp"))
+        }
+        queueLock.unlock()
+        headRetryCount = 0
+        drainBackoffMs = 0
+        lastRetryAfterMs = 0
+        pendingContinueMs = 0
+        nextSendAllowedMs = 0
+        clearPersistedBackoff()
+    }
+
+    /// Consent withdrawal rotates every local measurement identifier. Consent,
+    /// suppression, and an outstanding explicit delete marker remain authoritative.
+    private func clearLocalIdentityForConsentDenial(includePrivacyChoices: Bool = false) {
+        sessionStateLock.lock(); defer { sessionStateLock.unlock() }
+        PrivacyPersistence.clearIdentityAndEvents(
+            defaults: .standard,
+            queueURL: queueFileURL(),
+            includePrivacyChoices: includePrivacyChoices,
+            preservePendingDelete: true
+        )
+        installUuid = ""
+        userId = nil
+        userProperties = nil
+        pushToken = nil
+        integrityToken = nil
+        externalDeviceId = nil
+        pendingAttribution = nil
+        pendingDeferredDeepLink = nil
+        lastDeepLink = nil
+        lastDeepLinkReported = nil
+        lastAttributionCheckMs = 0
+        eventStateLock.lock()
+        lastCrashMs = 0
+        seenDedupIds.removeAll()
+        dedupOrder.removeAll()
+        eventStateLock.unlock()
+        snapIdfa = nil
+        snapIdfv = nil
+        cachedAttStatus = nil
+        firstInstallMs = 0
+        uikitSnapshotted = false
+        sessionOpen = false
+        sessionId = ""
+        sessionCount = 0
+        subsessionCount = 0
+        sessionActiveMs = 0
+        sessionStartElapsed = 0
+        lastBackgroundElapsed = 0
+        droppedCount = 0
+        stopHeartbeat()
+        globalLock.lock()
+        globalProperties.removeAll()
+        globalPropertySourceAtMs.removeAll()
+        partnerParameters.removeAll()
+        partnerParameterSourceAtMs.removeAll()
+        partnerSharing.removeAll()
+        globalLock.unlock()
+        if includePrivacyChoices {
+            advertisingConsent = false
+            thirdPartySharing = nil
         }
     }
 
-    /// POST a /privacy/delete for one install_uuid, HMAC-signed (+ company/app-key
-    /// headers) when a signing secret is configured (Unity parity). 2xx → true.
-    private func sendPrivacyDelete(_ uuid: String, _ uid: String?, _ completion: @escaping (Bool) -> Void) {
-        var body: [String: Any] = ["app_key": appKey, "install_uuid": uuid]
+    /// Start a new measurement lifetime after consent/enable re-opens transport.
+    private func activateAfterPrivacyGate() {
+        guard initialized, trackingEnabled, consentState != "denied" else { return }
+        if installUuid.isEmpty { installUuid = getOrCreateInstallUuid() }
+        if Thread.isMainThread { snapshotUIKit() }
+        else { DispatchQueue.main.sync { snapshotUIKit() } }
+        if firstInstallMs == 0 {
+            firstInstallMs = nowMs()
+            UserDefaults.standard.set(Double(firstInstallMs), forKey: "reflect_first_install_ms")
+        }
+        transportGate.allow()
+        registerConnectivityDrain()
+        scheduleDrain(0)
+        flushTimer?.cancel()
+        let ft = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .utility))
+        ft.schedule(deadline: .now() + .milliseconds(Int(flushIntervalMs)),
+                    repeating: .milliseconds(Int(flushIntervalMs)))
+        ft.setEventHandler { [weak self] in self?.scheduleDrain(0) }
+        flushTimer = ft
+        ft.resume()
+
+        if autoSessionTracking, let permit = transportGate.permit() {
+            queue.addOperation { [weak self] in self?.startSession(permit: permit) }
+        }
+        let defaults = UserDefaults.standard
+        let firstLaunch = !defaults.bool(forKey: "reflect_install_reported")
+        if firstLaunch {
+            defaults.set(true, forKey: "reflect_install_reported")
+            trackEventInternal(eventName: "app_install", propertiesJson: nil, referral: adServicesReferral())
+            trackEventInternal(eventName: "app_first_open", propertiesJson: nil, referral: nil)
+            if autoRegisterSkan { armSkan() }
+            if autoResolveDeferred {
+                scheduleDeferredDeepLinkResolution()
+            }
+        }
+        if autoSessionTracking { trackEventInternal(eventName: "app_open", propertiesJson: nil, referral: nil) }
+        scheduleAttributionCheck()
+    }
+
+    private func handleDeleteUserData(result: @escaping ReflectResult) {
+        // Linearization point: no analytics request can register after block(),
+        // and every request registered before it receives cancel().
+        let target = currentPrivacyDeleteTarget()
+        let currentUuid = PrivacyDeletePolicy.identifierForJournal(
+            initialized: initialized,
+            inMemory: installUuid,
+            persisted: UserDefaults.standard.string(forKey: "reflect_install_uuid"),
+            target: target
+        ) ?? pendingPrivacyDelete.allIntents().first(where: { $0.target == target })?.identifier
+        let uid = userId
+        trackingEnabled = false
+        transportGate.block()
+        let tombstonePersisted = privacyTombstone.update(trackingSuppressed: true)
+        UserDefaults.standard.set(true, forKey: "reflect_suppressed")
+        let defaultsPersisted = UserDefaults.standard.synchronize()
+        guard let currentUuid = currentUuid else {
+            // Do not erase the only identifier when no authenticated target can
+            // be journaled. The request remains locally fail-closed and reports
+            // failure instead of a false-positive successful deletion.
+            clearEventQueue()
+            result(ReflectError(
+                code: "privacy_delete_unavailable",
+                message: initialized
+                    ? "Privacy deletion requires a persisted install identifier and complete app configuration."
+                    : "Privacy deletion cannot be journaled before initialization.",
+                details: ["suppressionPersisted": tombstonePersisted || defaultsPersisted]
+            ))
+            return
+        }
+        // Crash-safe order: suppression and all unconfirmed remote identifiers
+        // reach durable defaults before any local identifier is erased.
+        let journal = pendingPrivacyDelete.journalSuppression(
+            currentUuid,
+            target: target
+        )
+        guard journal.durable else {
+            result(ReflectError(
+                code: "privacy_persistence_failed",
+                message: "Could not durably journal privacy deletion; identity was retained and transport remains blocked.",
+                details: nil
+            ))
+            return
+        }
+        let currentIntent = journal.intent
+        clearEventQueue()
+        clearLocalIdentityForConsentDenial(includePrivacyChoices: true)
+
+        // The dedicated privacy route bypasses analytics transport. A true callback
+        // covers every previously journaled lifetime, not only the newest UUID.
+        drainPendingDeletes(
+            pendingPrivacyDelete.allIntents(),
+            currentIntent: currentIntent,
+            currentUserId: uid
+        ) { complete in
+            DispatchQueue.main.async { result(complete) }
+        }
+    }
+
+    /// POST a /privacy/delete for one install_uuid. Authentication is mandatory,
+    /// and success requires the server's explicit {ok:true,queued:true} receipt.
+    private func currentPrivacyDeleteTarget() -> PrivacyDeleteTarget {
+        PrivacyDeleteTarget(baseUrl: baseUrl, appKey: appKey, companyKey: companyKey)
+    }
+
+    private func sendPrivacyDelete(
+        _ intent: PendingPrivacyDeleteIntent,
+        _ uid: String?,
+        _ completion: @escaping (Bool) -> Void
+    ) {
+        let currentTarget = currentPrivacyDeleteTarget()
+        guard PrivacyDeletePolicy.canDispatch(intent, using: currentTarget),
+              let target = intent.target else {
+            log("privacy/delete deferred — pending intent belongs to another or legacy-unscoped config")
+            completion(false)
+            return
+        }
+        guard let secret = PrivacyDeletePolicy.signingSecret(signingSecret) else {
+            log("privacy/delete deferred — signing secret unavailable")
+            completion(false)
+            return
+        }
+        var body: [String: Any] = ["app_key": target.appKey, "install_uuid": intent.identifier]
         if let u = uid { body["user_id"] = u }
         guard let bodyData = try? JSONSerialization.data(withJSONObject: body),
               let bodyStr = String(data: bodyData, encoding: .utf8),
-              let url = URL(string: "\(baseUrl)/privacy/delete") else { completion(false); return }
+              let url = URL(string: "\(target.baseUrl)/privacy/delete") else { completion(false); return }
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue(hostSdkVersion, forHTTPHeaderField: "X-Reflect-Sdk")
-        if let secret = signingSecret, !secret.isEmpty {
-            request.setValue(appKey, forHTTPHeaderField: "X-Reflect-App-Key")
-            if let ck = companyKey, !ck.isEmpty { request.setValue(ck, forHTTPHeaderField: "X-Reflect-Company-Key") }
-            request.setValue(hmacHex(bodyStr, secret), forHTTPHeaderField: "X-Reflect-Signature")
-            request.setValue("1", forHTTPHeaderField: "X-Reflect-Signature-Version")
-        }
+        request.setValue(target.appKey, forHTTPHeaderField: "X-Reflect-App-Key")
+        if let ck = target.companyKey, !ck.isEmpty { request.setValue(ck, forHTTPHeaderField: "X-Reflect-Company-Key") }
+        request.setValue(hmacHex(bodyStr, secret), forHTTPHeaderField: "X-Reflect-Signature")
+        request.setValue("1", forHTTPHeaderField: "X-Reflect-Signature-Version")
         request.httpBody = bodyData
         request.timeoutInterval = 10
-        URLSession.shared.dataTask(with: request) { _, response, _ in
+        URLSession.shared.dataTask(with: request) { data, response, _ in
             let code = (response as? HTTPURLResponse)?.statusCode ?? 0
-            completion(code >= 200 && code < 300)
+            completion(PrivacyDeletePolicy.isAccepted(statusCode: code, data: data))
         }.resume()
     }
 
     /// On launch, retry an unconfirmed /privacy/delete (GDPR durability, Unity parity).
     private func retryPendingDelete() {
-        guard let pending = UserDefaults.standard.string(forKey: "reflect_pending_delete"),
-              !pending.isEmpty else { return }
-        sendPrivacyDelete(pending, nil) { ok in
-            if ok { UserDefaults.standard.removeObject(forKey: "reflect_pending_delete") }
+        drainPendingDeletes(pendingPrivacyDelete.allIntents(), currentIntent: nil, currentUserId: nil) { _ in }
+    }
+
+    private func drainPendingDeletes(
+        _ pending: [PendingPrivacyDeleteIntent],
+        currentIntent: PendingPrivacyDeleteIntent?,
+        currentUserId: String?,
+        allAccepted: Bool = true,
+        completion: @escaping (Bool) -> Void
+    ) {
+        guard let first = pending.first else {
+            completion(allAccepted && pendingPrivacyDelete.allIntents().isEmpty)
+            return
+        }
+        sendPrivacyDelete(first, first == currentIntent ? currentUserId : nil) { ok in
+            if ok { self.pendingPrivacyDelete.removeIfMatches(first) }
+            self.drainPendingDeletes(
+                Array(pending.dropFirst()),
+                currentIntent: currentIntent,
+                currentUserId: currentUserId,
+                allAccepted: allAccepted && ok,
+                completion: completion
+            )
         }
     }
 
@@ -1012,22 +1627,39 @@ public class ReflectCore: NSObject {
     private func trackEventInternal(eventName: String, propertiesJson: String?, referral: [String: Any]?,
                                     topLevel: [String: Any]? = nil, callbackId: String? = nil,
                                     callbackParamsJson: String? = nil, partnerParamsJson: String? = nil,
-                                    deduplicationId: String? = nil) {
+                                    deduplicationId: String? = nil,
+                                    acceptedPermit: PrivacyTransportGate.Permit? = nil) {
         if !initialized || !trackingEnabled { return }   // forget-me / disable latch
+        // Bind queued build work to the generation in which the API call was
+        // accepted. A deny/delete followed by a quick reopen invalidates it.
+        guard let permit = acceptedPermit ?? transportGate.permit(),
+              transportGate.isValid(permit) else { return }
         queue.addOperation { [weak self] in
             guard let self = self else { return }
-            // Client-side de-dup (Unity parity): drop an event whose deduplication_id
-            // was seen recently. Runs on the serial queue → no lock. No id ⇒ always pass.
+            // Work accepted just before a privacy transition may still be waiting
+            // on the serial queue. Re-check policy at execution time.
+            guard self.trackingEnabled, self.consentState != "denied",
+                  self.transportGate.isValid(permit) else { return }
+            self.pruneExpiredEphemeralParameters()
+            self.eventStateLock.lock()
+            guard self.transportGate.isValid(permit) else {
+                self.eventStateLock.unlock()
+                return
+            }
             if let d = deduplicationId, !d.isEmpty, self.isDuplicateEvent(d) {
+                self.eventStateLock.unlock()
                 self.log("Dropped duplicate '\(eventName)' (dedup_id=\(d))")
                 return
             }
-            // Crash-report throttle (Unity parity): cap `_crash` to 1/min.
             if eventName == "_crash" {
                 let now = self.nowMs()
-                if now - self.lastCrashMs < 60_000 { return }
+                if now - self.lastCrashMs < 60_000 {
+                    self.eventStateLock.unlock()
+                    return
+                }
                 self.lastCrashMs = now
             }
+            self.eventStateLock.unlock()
             var payload: [String: Any] = [
                 "app_key": self.appKey,
                 "event_name": eventName,
@@ -1090,12 +1722,19 @@ public class ReflectCore: NSObject {
 
             if let data = try? JSONSerialization.data(withJSONObject: payload),
                let json = String(data: data, encoding: .utf8) {
-                self.enqueue(json)
+                self.enqueue(json, permit: permit)
             }
         }
     }
 
     // MARK: - Durable event queue (persist → drain → retry)
+
+    private func privacyTombstoneFileURL() -> URL? {
+        let fm = FileManager.default
+        guard let dir = try? fm.url(for: .applicationSupportDirectory, in: .userDomainMask,
+                                    appropriateFor: nil, create: true) else { return nil }
+        return dir.appendingPathComponent(ReflectCore.privacyTombstoneFileName)
+    }
 
     private func queueFileURL() -> URL? {
         let fm = FileManager.default
@@ -1111,6 +1750,7 @@ public class ReflectCore: NSObject {
         for line in text.split(separator: "\n", omittingEmptySubsequences: true) {
             eventQueue.append(String(line))
         }
+        scrubQueueLocked()
         queueLock.unlock()
     }
 
@@ -1119,6 +1759,20 @@ public class ReflectCore: NSObject {
         guard let url = queueFileURL() else { return }
         let text = eventQueue.joined(separator: "\n")
         try? text.write(to: url, atomically: true, encoding: .utf8)
+    }
+
+    /// Caller MUST hold queueLock. Removes expired click context from legacy
+    /// queue rows and drops malformed rows fail closed.
+    private func scrubQueueLocked(
+        nowMs: Int64 = Int64(Date().timeIntervalSince1970 * 1000)
+    ) {
+        let scrubbed = eventQueue.compactMap {
+            AttributionRetention.scrubQueuedEvent($0, nowMs: nowMs)
+        }
+        if scrubbed != eventQueue {
+            eventQueue = scrubbed
+            persistQueueLocked()
+        }
     }
 
     /// Diagnostics snapshot for Reflect.debugSnapshot() / the debug overlay.
@@ -1165,8 +1819,16 @@ public class ReflectCore: NSObject {
         return false
     }
 
-    private func enqueue(_ payload: String) {
+    private func enqueue(_ payload: String, permit: PrivacyTransportGate.Permit) {
+        guard trackingEnabled, consentState != "denied", transportGate.isValid(permit) else { return }
+        guard let retentionSafePayload = AttributionRetention.scrubQueuedEvent(payload) else { return }
+        var transientEventId: String?
         queueLock.lock()
+        guard trackingEnabled, consentState != "denied", transportGate.isValid(permit) else {
+            queueLock.unlock()
+            return
+        }
+        scrubQueueLocked()
         // Overflow → drop the NEWEST (this event) instead of the oldest, so the
         // attribution-critical install/first-session events at the head survive a
         // sustained backlog (Unity parity).
@@ -1175,9 +1837,30 @@ public class ReflectCore: NSObject {
             queueLock.unlock()
             return
         }
-        eventQueue.append(payload)
+        eventQueue.append(retentionSafePayload)
+        if AttributionRetention.hasTransientAttributionContext(payload),
+           let eventId = extractEventId(retentionSafePayload) {
+            transientEventId = eventId
+            transientAttributionPayloads[eventId] = (
+                payload: payload,
+                expiresAtMs: nowMs() + ReflectCore.transientAttributionTtlMs
+            )
+        }
         persistQueueLocked()
         queueLock.unlock()
+        if let transientEventId {
+            DispatchQueue.global(qos: .utility).asyncAfter(
+                deadline: .now() + .milliseconds(Int(ReflectCore.transientAttributionTtlMs))
+            ) { [weak self] in
+                guard let self else { return }
+                self.queueLock.lock()
+                if let current = self.transientAttributionPayloads[transientEventId],
+                   current.expiresAtMs <= self.nowMs() {
+                    self.transientAttributionPayloads.removeValue(forKey: transientEventId)
+                }
+                self.queueLock.unlock()
+            }
+        }
         scheduleDrain(0)
     }
 
@@ -1199,14 +1882,27 @@ public class ReflectCore: NSObject {
     // Runs on a background dispatch queue (via scheduleDrain), decoupled from the
     // event-build OperationQueue. beginSending() keeps exactly one in flight.
     private func drain() {
-        if !initialized { return }
+        queueLock.lock(); scrubQueueLocked(); queueLock.unlock()
+        if !initialized || !trackingEnabled { return }
         if offlineMode || localOnly { return }   // offline / debug-mode → keep queued, don't send
-        if consentState == "denied" { return }   // consent denied → HOLD on-device, never transmit (GDPR)
+        if consentState == "denied" { return }
+        guard let permit = transportGate.permit() else { return }
         if !beginSending() { return }
         var releaseGuard = true
-        defer { if releaseGuard { endSending() } }
+        defer {
+            if releaseGuard { endSending() }
+            // If this drain was cancelled and consent was re-opened before its
+            // completion arrived, make sure the fresh generation is not stranded.
+            if !transportGate.isValid(permit), transportGate.permit() != nil {
+                queueLock.lock(); let hasEvents = !eventQueue.isEmpty; queueLock.unlock()
+                if hasEvents { scheduleDrain(0) }
+            }
+        }
         while true {
-            if offlineMode { break }   // toggled offline mid-drain → stop sending
+            if !trackingEnabled || consentState == "denied" || offlineMode || !transportGate.isValid(permit) { break }
+            // A long multi-batch drain can cross the retention boundary.
+            // Re-scrub the durable head immediately before every snapshot.
+            queueLock.lock(); scrubQueueLocked(); queueLock.unlock()
             // Honor the send gate (retry backoff / continue_in pace) authoritatively,
             // so a competing scheduleDrain(0) can't bypass it.
             let now = monotonicMs()
@@ -1218,39 +1914,60 @@ public class ReflectCore: NSObject {
             queueLock.lock()
             let n = min(cfgBatchSize, eventQueue.count)
             let rawBatch = Array(eventQueue.prefix(n))
+            let immediateBatch = rawBatch.map { transientPayloadForImmediateSendLocked($0) }
             let qsize = eventQueue.count
             queueLock.unlock()
             // X2: re-stamp the LIVE consent/sharing/ATT onto each queued event just before
             // send (Adjust updatePackagesTrackingI) — a frozen-at-enqueue event otherwise
             // transmits a stale decision (e.g. an install built pre-ATT-grant).
-            let batchEvents = rawBatch.map { restampConsent($0) }
+            let batchEvents = immediateBatch.map { restampConsent($0) }
             if batchEvents.isEmpty { break }
-            switch postBatch(batchEvents, headRetryCount, qsize) {
+            switch postBatch(batchEvents, headRetryCount, qsize, permit) {
             case .success, .drop:
+                if !transportGate.isValid(permit) { break }
                 queueLock.lock()
-                eventQueue.removeFirst(min(batchEvents.count, eventQueue.count))
-                persistQueueLocked()
+                let sameHead = eventQueue.count >= rawBatch.count &&
+                    Array(eventQueue.prefix(rawBatch.count)) == rawBatch &&
+                    transportGate.isValid(permit)
+                if sameHead {
+                    for persisted in rawBatch {
+                        if let eventId = extractEventId(persisted) {
+                            transientAttributionPayloads.removeValue(forKey: eventId)
+                        }
+                    }
+                    eventQueue.removeFirst(rawBatch.count)
+                    persistQueueLocked()
+                }
                 queueLock.unlock()
-                drainBackoffMs = 0
-                headRetryCount = 0
-                nextSendAllowedMs = 0
-                clearPersistedBackoff()
-                // Server-requested pacing: gate the NEXT batch by continue_in.
-                let pace = pendingContinueMs
-                pendingContinueMs = 0
+                if !sameHead { break }
+                var pace: Int64 = 0
+                guard transportGate.runIfValid(permit, {
+                    drainBackoffMs = 0
+                    headRetryCount = 0
+                    nextSendAllowedMs = 0
+                    clearPersistedBackoff()
+                    pace = pendingContinueMs
+                    pendingContinueMs = 0
+                    if pace > 0 { nextSendAllowedMs = monotonicMs() + pace }
+                }) else { break }
                 if pace > 0 {
-                    nextSendAllowedMs = monotonicMs() + pace
                     endSending(); releaseGuard = false; scheduleDrain(pace); return
                 }
             case .retry:
-                headRetryCount += 1
-                drainBackoffMs = nextBackoff(drainBackoffMs, lastRetryAfterMs)
-                nextSendAllowedMs = monotonicMs() + drainBackoffMs
-                persistBackoff(drainBackoffMs)   // survive app restart
+                var retryDelay: Int64 = 0
+                guard transportGate.runIfValid(permit, {
+                    headRetryCount += 1
+                    drainBackoffMs = nextBackoff(drainBackoffMs, lastRetryAfterMs)
+                    nextSendAllowedMs = monotonicMs() + drainBackoffMs
+                    persistBackoff(drainBackoffMs)
+                    retryDelay = drainBackoffMs
+                }) else { break }
                 endSending()            // release before scheduling the retry
                 releaseGuard = false
-                scheduleDrain(drainBackoffMs)
+                scheduleDrain(retryDelay)
                 return
+            case .cancelled:
+                break
             }
         }
     }
@@ -1289,7 +2006,13 @@ public class ReflectCore: NSObject {
     /// POST one event and classify: success=2xx (delete), drop=permanent 4xx
     /// (malformed → delete), retry=429/408/5xx/network/timeout (keep + backoff,
     /// honoring Retry-After). Blocks the calling background op via a semaphore.
-    private func postBatch(_ events: [String], _ retryCount: Int, _ queueSize: Int) -> SendResult {
+    private func postBatch(
+        _ events: [String],
+        _ retryCount: Int,
+        _ queueSize: Int,
+        _ permit: PrivacyTransportGate.Permit
+    ) -> SendResult {
+        guard transportGate.isValid(permit) else { return .cancelled }
         lastRetryAfterMs = 0
         pendingContinueMs = 0
         let bid = batchId(events)
@@ -1322,12 +2045,16 @@ public class ReflectCore: NSObject {
         request.httpBody = wireBody
         request.timeoutInterval = 15
         var outcome: SendResult = .retry
+        var responseRetryIn: Int64 = 0
+        var responseContinueIn: Int64 = 0
+        var responseCode = 0
         let sem = DispatchSemaphore(value: 0)
         let task = URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
             defer { sem.signal() }
             if error != nil { outcome = .retry; return }
             guard let http = response as? HTTPURLResponse else { outcome = .retry; return }
             let code = http.statusCode
+            responseCode = code
             switch code {
             case 200..<300: outcome = .success
             case 408, 429, 500..<600: outcome = .retry
@@ -1340,14 +2067,23 @@ public class ReflectCore: NSObject {
             // Honor Retry-After on ANY retryable response (Unity parity), not just 429/503.
             let hdrRetry = (outcome == .retry)
                 ? (self?.parseRetryAfter(http.value(forHTTPHeaderField: "Retry-After")) ?? 0) : 0
-            self?.lastRetryAfterMs  = directives.retryIn > 0 ? directives.retryIn : hdrRetry
-            self?.pendingContinueMs = (200..<300).contains(code) ? directives.continueIn : 0
-            let ri = self?.lastRetryAfterMs ?? 0, ci = self?.pendingContinueMs ?? 0
-            self?.log("Batch sent → \(code) \(signed ? "(signed /event)" : "(/event/batch)") [n=\(events.count) batch=\(bid) retry=\(retryCount) q=\(queueSize)]"
-                + (ri > 0 ? " retry_in=\(ri)ms" : "") + (ci > 0 ? " continue_in=\(ci)ms" : ""))
+            responseRetryIn = directives.retryIn > 0 ? directives.retryIn : hdrRetry
+            responseContinueIn = (200..<300).contains(code) ? directives.continueIn : 0
+        }
+        guard transportGate.register(task, permit: permit, cancel: { task.cancel() }) else {
+            task.cancel()
+            return .cancelled
         }
         task.resume()
         sem.wait()
+        transportGate.unregister(task)
+        guard transportGate.runIfValid(permit, {
+            lastRetryAfterMs = responseRetryIn
+            pendingContinueMs = responseContinueIn
+            log("Batch sent → \(responseCode) \(signed ? "(signed /event)" : "(/event/batch)") [n=\(events.count) batch=\(bid) retry=\(retryCount) q=\(queueSize)]"
+                + (responseRetryIn > 0 ? " retry_in=\(responseRetryIn)ms" : "")
+                + (responseContinueIn > 0 ? " continue_in=\(responseContinueIn)ms" : ""))
+        }) else { return .cancelled }
         return outcome
     }
 
@@ -1373,6 +2109,23 @@ public class ReflectCore: NSObject {
         let rest = eventJson[r.upperBound...]
         guard let end = rest.firstIndex(of: "\"") else { return nil }
         return String(rest[..<end])
+    }
+
+    /// Caller holds queueLock. The durable row is always coarse; a raw
+    /// install-referrer override exists only for the first 30 seconds of the
+    /// current process so the normal online install keeps deterministic credit.
+    private func transientPayloadForImmediateSendLocked(
+        _ persistedPayload: String
+    ) -> String {
+        guard let eventId = extractEventId(persistedPayload),
+              let current = transientAttributionPayloads[eventId] else {
+            return persistedPayload
+        }
+        if current.expiresAtMs <= nowMs() {
+            transientAttributionPayloads.removeValue(forKey: eventId)
+            return persistedPayload
+        }
+        return current.payload
     }
 
     private func monotonicMs() -> Int64 { return Int64(ProcessInfo.processInfo.systemUptime * 1000) }
@@ -1418,111 +2171,216 @@ public class ReflectCore: NSObject {
 
     /// Resolve a deferred deep link via POST /deeplink/resolve. Emits the
     /// resolved link on the onDeepLink stream with isDeferred = true.
-    private func resolveDeferredDeepLink() {
-        if consentState == "denied" || localOnly { return }   // GDPR / debug-mode: no /deeplink/resolve
-        setPendingSignal("reflect_pending_deferred_dl", true)   // X1: stay pending until a real response lands
+    private func resolveDeferredDeepLink(permit: PrivacyTransportGate.Permit) {
+        if !trackingEnabled || consentState == "denied" || localOnly || !transportGate.isValid(permit) { return }
+        guard transportGate.runIfValid(permit, {
+            setPendingSignal("reflect_pending_deferred_dl", true)
+        }) else { return }
         let bodyDict: [String: Any] = ["app_key": appKey, "install_uuid": installUuid]
         guard let bodyData = try? JSONSerialization.data(withJSONObject: bodyDict),
               let body = String(data: bodyData, encoding: .utf8) else { return }
         let sig = (signingSecret?.isEmpty == false) ? hmacHex(body, signingSecret!) : nil
-        guard let resp = httpJson("\(baseUrl)/deeplink/resolve", "POST", body, sig) else { return }  // offline → stay pending
-        setPendingSignal("reflect_pending_deferred_dl", false)   // got a response (link or not) → resolved
+        guard let resp = httpJson("\(baseUrl)/deeplink/resolve", "POST", body, sig, permit: permit) else { return }
         guard let data = resp.data(using: .utf8),
-              let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-              let path = obj["deep_link_path"] as? String, !path.isEmpty else { return }
-
-        var params: [String: String] = [:]
-        if let p = obj["deep_link_params"] as? [String: Any] {
-            for (k, v) in p { params[k] = "\(v)" }
+              let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return }
+        var callbackMap: [String: Any]?
+        var reportProps: [String: Any]?
+        guard transportGate.runIfValid(permit, {
+            setPendingSignal("reflect_pending_deferred_dl", false)
+            guard let path = obj["deep_link_path"] as? String, !path.isEmpty else { return }
+            var params: [String: String] = [:]
+            if let p = obj["deep_link_params"] as? [String: Any] {
+                for (k, v) in p { params[k] = "\(v)" }
+            }
+            var map: [String: Any] = ["url": path, "path": path, "isDeferred": true, "params": params]
+            if let c = params["click_id"] { map["clickId"] = c }
+            if let c = params["campaign"] { map["campaign"] = c }
+            if let pr = params["partner"] { map["partner"] = pr }
+            let retainedPath = AttributionRetention.urlWithoutQueryOrFragment(path)
+            lastDeepLink = retainedPath
+            callbackMap = map
+            if retainedPath != lastDeepLinkReported {
+                lastDeepLinkReported = retainedPath
+                reportProps = deepLinkOpenedProperties(path, params, "deferred")
+            }
+        }) else { return }
+        if let callbackMap = callbackMap { emitDeepLink(callbackMap, acceptedPermit: permit) }
+        if let reportProps = reportProps {
+            emitJsonEvent("deep_link_opened", reportProps, nil, acceptedPermit: permit)
         }
-        var map: [String: Any] = ["url": path, "path": path, "isDeferred": true, "params": params]
-        if let c = params["click_id"] { map["clickId"] = c }
-        if let c = params["campaign"] { map["campaign"] = c }
-        if let pr = params["partner"] { map["partner"] = pr }
-        lastDeepLink = path   // GetLastDeeplink (Unity parity)
-        emitDeepLink(map)
-        // Fire deep_link_opened on the DEFERRED branch too (Unity parity).
-        reportDeepLinkOpened(path, params, "deferred")
     }
 
     /// Poll GET /attribution/check (HMAC-signed query) once per session. On a
     /// newer attribution row, persist it (so getAttribution works) + the
     /// watermark, and push onAttributionChanged. Needs signingSecret.
-    private func attributionCheck(forceFresh: Bool = false, attempt: Int = 0, askAttempt: Int = 0) {
-        if consentState == "denied" || localOnly { return }   // GDPR / debug-mode: no /attribution/check
+    private func attributionCheck(
+        forceFresh: Bool = false,
+        attempt: Int = 0,
+        askAttempt: Int = 0,
+        permit: PrivacyTransportGate.Permit
+    ) {
+        if !trackingEnabled || consentState == "denied" || localOnly || !transportGate.isValid(permit) { return }
         guard let secret = signingSecret, !secret.isEmpty else { return }
-        if attempt == 0 { setPendingSignal("reflect_pending_attr", true) }   // X1: durable retry across process death
+        if attempt == 0 && !transportGate.runIfValid(permit, {
+            setPendingSignal("reflect_pending_attr", true)
+        }) { return }
         let encoded = installUuid.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? installUuid
-        let since = forceFresh ? 0 : lastAttributionCheckMs
+        let defaults = UserDefaults.standard
+        // SDKs released before the retention contract cached clickId without
+        // its expiry. Fetch that row once with since=0 so an upgraded client
+        // can enforce the boundary while offline.
+        let needsExpiryBootstrap =
+            defaults.object(forKey: "reflect_attr_click_context_expires_at_ms") == nil &&
+            defaults.string(forKey: "reflect_attribution_json") != nil
+        let since = (forceFresh || needsExpiryBootstrap) ? 0 : lastAttributionCheckMs
         let query = "install_uuid=\(encoded)&since=\(since)"
-        guard let resp = httpJson("\(baseUrl)/attribution/check?\(query)", "GET", nil, hmacHex(query, secret)) else {
+        guard let resp = httpJson("\(baseUrl)/attribution/check?\(query)", "GET", nil,
+                                  hmacHex(query, secret), permit: permit) else {
             // Transient failure → retry {2s,5s} up to 3 attempts (Unity parity), so an
             // attribution that resolves while we were offline at install isn't missed.
             if attempt < 2 {
                 let delayMs = attempt == 0 ? 2000 : 5000
                 DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + .milliseconds(delayMs)) { [weak self] in
-                    self?.attributionCheck(forceFresh: forceFresh, attempt: attempt + 1, askAttempt: askAttempt)
+                    self?.attributionCheck(forceFresh: forceFresh, attempt: attempt + 1,
+                                           askAttempt: askAttempt, permit: permit)
                 }
             }
             return   // network failure → stay pending (X1); retried on connectivity/next launch
         }
-        setPendingSignal("reflect_pending_attr", false)   // X1: got a response → resolved
         guard let data = resp.data(using: .utf8),
               let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return }
         guard (obj["changed"] as? Bool) == true, let d = obj["data"] as? [String: Any] else {
             // A3: honor a server-driven `ask_in` — attribution not resolved yet; re-poll
             // that far out, bounded so an organic install doesn't poll forever.
-            if let dir = obj["directives"] as? [String: Any] {
-                let askIn = (dir["ask_in"] as? Int) ?? Int((dir["ask_in"] as? Double) ?? 0)
-                if askIn > 0, askIn <= Int(ReflectCore.maxBackoffMs), askAttempt < ReflectCore.maxAskInRepolls {
-                    DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + .milliseconds(askIn)) { [weak self] in
-                        self?.attributionCheck(forceFresh: true, attempt: 0, askAttempt: askAttempt + 1)
+            _ = transportGate.runIfValid(permit) {
+                setPendingSignal("reflect_pending_attr", false)
+                if let dir = obj["directives"] as? [String: Any] {
+                    let askIn = (dir["ask_in"] as? Int) ?? Int((dir["ask_in"] as? Double) ?? 0)
+                    if askIn > 0, askIn <= Int(ReflectCore.maxBackoffMs), askAttempt < ReflectCore.maxAskInRepolls {
+                        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + .milliseconds(askIn)) { [weak self] in
+                            self?.attributionCheck(forceFresh: true, attempt: 0,
+                                                   askAttempt: askAttempt + 1, permit: permit)
+                        }
                     }
                 }
             }
             return
         }
-
-        let attributedAt = (d["attributed_at_ms"] as? Int64) ?? Int64((d["attributed_at_ms"] as? Double) ?? 0)
-        if attributedAt > lastAttributionCheckMs {
-            lastAttributionCheckMs = attributedAt
-            UserDefaults.standard.set(Int(attributedAt), forKey: "reflect_attr_watermark")
-        }
-
-        // Map server fields → AttributionData keys (type/partner/campaign/clickId).
-        var map: [String: Any] = [:]
-        if let t = d["attribution_type"] as? String { map["type"] = t }
-        if let p = d["partner_slug"] as? String { map["partner"] = p }
-        if let c = d["campaign_name"] as? String { map["campaign"] = c }
-        if let ci = d["click_id"] as? String { map["clickId"] = ci }
-
-        // Value-level change detection (Adjust `equals` dedup): only surface the callback
-        // when a field actually changed — a server re-stamp with identical tracker fields
-        // must NOT fire a spurious onAttribution.
-        var changed = true
-        if let pdata = try? JSONSerialization.data(withJSONObject: map, options: .sortedKeys),
-           let pstr = String(data: pdata, encoding: .utf8) {   // sortedKeys → stable across restarts (dicts are unordered)
-            changed = pstr != UserDefaults.standard.string(forKey: "reflect_attribution_json")
-            UserDefaults.standard.set(pstr, forKey: "reflect_attribution_json")
-        }
-        if changed { emitAttribution(map) }
+        var callbackMap: [String: Any]?
+        guard transportGate.runIfValid(permit, {
+            setPendingSignal("reflect_pending_attr", false)
+            let attributedAt = (d["attributed_at_ms"] as? Int64)
+                ?? Int64((d["attributed_at_ms"] as? Double) ?? 0)
+            let revisionAt = (d["attribution_revision_ms"] as? Int64)
+                ?? Int64((d["attribution_revision_ms"] as? Double) ?? Double(attributedAt))
+            if revisionAt > lastAttributionCheckMs {
+                lastAttributionCheckMs = revisionAt
+            }
+            let clickContextExpiresAt = max(
+                0,
+                (d["click_context_expires_at_ms"] as? Int64)
+                    ?? Int64((d["click_context_expires_at_ms"] as? Double) ?? 0)
+            )
+            var map: [String: Any] = [:]
+            if let t = d["attribution_type"] as? String { map["type"] = t }
+            if let p = d["partner_slug"] as? String { map["partner"] = p }
+            if let c = d["campaign_name"] as? String { map["campaign"] = c }
+            if clickContextExpiresAt > 0,
+               let ci = d["click_id"] as? String,
+               !AttributionRetention.isExpired(expiresAtMs: clickContextExpiresAt) {
+                map["clickId"] = ci
+            }
+            // clickId is callback-only. Persist only coarse attribution fields:
+            // an exact id/expiry cannot be physically removed while iOS keeps an
+            // app suspended or the user never launches it again.
+            var persistentMap = map
+            persistentMap.removeValue(forKey: "clickId")
+            if let pdata = try? JSONSerialization.data(withJSONObject: persistentMap, options: .sortedKeys),
+               let pstr = String(data: pdata, encoding: .utf8) {
+                defaults.set(Int(lastAttributionCheckMs), forKey: "reflect_attr_watermark")
+                defaults.removeObject(forKey: "reflect_attr_click_context_expires_at_ms")
+                defaults.set(pstr, forKey: "reflect_attribution_json")
+            }
+            // changed=true already denotes a newer server revision. Deliver its
+            // volatile clickId even if persisted coarse fields are identical.
+            callbackMap = map
+        }) else { return }
+        if let callbackMap = callbackMap { emitAttribution(callbackMap, acceptedPermit: permit) }
     }
 
-    private func emitDeepLink(_ map: [String: Any]) {
+    private func emitDeepLink(_ map: [String: Any], acceptedPermit: PrivacyTransportGate.Permit? = nil) {
+        let wasInitialized = initialized
+        let permit = acceptedPermit ?? (wasInitialized ? transportGate.permit() : nil)
         DispatchQueue.main.async {
-            if let l = self.listener { l.onDeepLink(map) } else { self.pendingDeferredDeepLink = map }
+            if wasInitialized {
+                guard let permit = permit, self.transportGate.isValid(permit) else { return }
+            } else {
+                guard self.mutateMeasurementState({}).applied else { return }
+            }
+            if let l = self.listener {
+                l.onDeepLink(map)
+            } else {
+                self.pendingDeferredDeepLink = self.retainedDeepLinkCallback(map)
+            }
         }
     }
 
-    private func emitAttribution(_ map: [String: Any]) {
+    private func retainedDeepLinkCallback(_ map: [String: Any]) -> [String: Any] {
+        var retained = map
+        if let url = retained["url"] as? String {
+            retained["url"] = AttributionRetention.urlWithoutQueryOrFragment(url)
+        }
+        if let path = retained["path"] as? String {
+            retained["path"] = AttributionRetention.urlWithoutQueryOrFragment(path)
+        }
+        for key in [
+            "clickId", "click_id", "ext_click_id", "clickid",
+            "sub1", "sub2", "sub3", "sub4", "sub5",
+        ] {
+            retained.removeValue(forKey: key)
+        }
+        if let params = retained["params"] as? [String: Any] {
+            retained["params"] = params.filter { $0.key == "campaign" || $0.key == "partner" }
+        } else if retained["params"] != nil {
+            retained["params"] = [String: Any]()
+        }
+        return retained
+    }
+
+    private func retainedAttributionCallback(_ map: [String: Any]) -> [String: Any] {
+        var retained = map
+        for key in [
+            "clickId", "click_id", "ext_click_id", "clickid",
+            "sub1", "sub2", "sub3", "sub4", "sub5",
+        ] {
+            retained.removeValue(forKey: key)
+        }
+        return retained
+    }
+
+    private func emitAttribution(_ map: [String: Any], acceptedPermit: PrivacyTransportGate.Permit? = nil) {
+        guard let permit = acceptedPermit ?? transportGate.permit() else { return }
         DispatchQueue.main.async {
-            if let l = self.listener { l.onAttribution(map) } else { self.pendingAttribution = map }
+            guard self.transportGate.isValid(permit) else { return }
+            if let l = self.listener {
+                l.onAttribution(map)
+            } else {
+                self.pendingAttribution = self.retainedAttributionCallback(map)
+            }
         }
     }
 
     /// GET/POST JSON, blocking via semaphore on the calling background queue.
     /// Returns the response body on 2xx, else nil.
-    private func httpJson(_ urlStr: String, _ method: String, _ body: String?, _ signature: String?) -> String? {
+    private func httpJson(
+        _ urlStr: String,
+        _ method: String,
+        _ body: String?,
+        _ signature: String?,
+        permit: PrivacyTransportGate.Permit
+    ) -> String? {
+        if offlineMode || localOnly { return nil }
+        guard transportGate.isValid(permit) else { return nil }
         guard let url = URL(string: urlStr) else { return nil }
         var req = URLRequest(url: url)
         req.httpMethod = method
@@ -1541,9 +2399,14 @@ public class ReflectCore: NSObject {
                   (200..<300).contains(http.statusCode), let data = data else { return }
             out = String(data: data, encoding: .utf8)
         }
+        guard transportGate.register(task, permit: permit, cancel: { task.cancel() }) else {
+            task.cancel()
+            return nil
+        }
         task.resume()
         sem.wait()
-        return out
+        transportGate.unregister(task)
+        return transportGate.isValid(permit) ? out : nil
     }
 
     private func hmacHex(_ data: String, _ secret: String) -> String {
@@ -1616,12 +2479,19 @@ public class ReflectCore: NSObject {
     /// Verify a purchase receipt server-side (Unity HttpDispatcher.VerifyPurchase
     /// parity). Body is a HAND-BUILT string in Unity's exact key order, signed over
     /// the raw bytes. Returns {status, code, message}.
-    private func verifyPurchaseHttp(_ args: [String: Any]?) -> [String: Any] {
+    private func verifyPurchaseHttp(
+        _ args: [String: Any]?,
+        permit: PrivacyTransportGate.Permit?
+    ) -> [String: Any] {
         let productId     = args?["productId"] as? String ?? ""
         let transactionId = args?["transactionId"] as? String ?? ""
         let purchaseToken = args?["purchaseToken"] as? String ?? ""
         let receiptData   = args?["receiptData"] as? String ?? ""
         if baseUrl.isEmpty { return ["status": "unknown", "code": 0, "message": "debug_mode"] }
+        guard let permit = permit, trackingEnabled, consentState != "denied",
+              transportGate.isValid(permit) else {
+            return ["status": "failed", "code": 0, "message": "privacy_blocked"]
+        }
         let body = "{"
             + "\"app_key\":"        + jq(appKey)        + ","
             + "\"install_uuid\":"   + jq(installUuid)   + ","
@@ -1632,7 +2502,7 @@ public class ReflectCore: NSObject {
             + "}"
         let secret = (signingSecret?.isEmpty == false) ? signingSecret : nil
         let sig = secret.map { hmacHex(body, $0) }
-        guard let resp = httpJson("\(baseUrl)/purchase/verify", "POST", body, sig) else {
+        guard let resp = httpJson("\(baseUrl)/purchase/verify", "POST", body, sig, permit: permit) else {
             return ["status": "failed", "code": 0, "message": "request_failed"]
         }
         guard let data = resp.data(using: .utf8),
@@ -1843,7 +2713,8 @@ public class ReflectCore: NSObject {
         snapScreenDensityDpi = Int(scale * 160)
         snapDeviceType = UIDevice.current.userInterfaceIdiom == .pad ? "tablet" : "phone"
         snapSystemVersion = UIDevice.current.systemVersion
-        snapIdfv = UIDevice.current.identifierForVendor?.uuidString
+        snapIdfv = (trackingEnabled && consentState != "denied")
+            ? UIDevice.current.identifierForVendor?.uuidString : nil
         uikitSnapshotted = true
         refreshAttStatus()
         refreshIdfa()
@@ -1853,6 +2724,10 @@ public class ReflectCore: NSObject {
     /// in the background buildDevice). Refreshed on each activation since ATT auth
     /// can change after the prompt. buildDevice still gates on advertisingConsent.
     private func refreshIdfa() {
+        guard trackingEnabled, consentState != "denied", advertisingConsent, !ffCoppa else {
+            snapIdfa = nil
+            return
+        }
         if #available(iOS 14, *) {
             #if canImport(AppTrackingTransparency)
             snapIdfa = (ATTrackingManager.trackingAuthorizationStatus == .authorized)
@@ -1886,7 +2761,16 @@ public class ReflectCore: NSObject {
     // (subsessions); it ends only after a > sessionGapMs background or is recovered
     // on the next launch if the process died mid-session.
 
-    private func startSession(intervalMs: Int64 = -1) {
+    @discardableResult
+    private func sessionMutation(_ permit: PrivacyTransportGate.Permit, _ action: () -> Void) -> Bool {
+        sessionStateLock.lock(); defer { sessionStateLock.unlock() }
+        guard trackingEnabled, consentState != "denied", transportGate.isValid(permit) else { return false }
+        action()
+        return true
+    }
+
+    private func startSession(intervalMs: Int64 = -1, permit: PrivacyTransportGate.Permit) {
+        sessionMutation(permit) {
         sessionCount += 1
         sessionActiveMs = 0
         subsessionCount = 1          // the opening foreground is subsession 1 (Unity parity)
@@ -1901,62 +2785,75 @@ public class ReflectCore: NSObject {
         d.set(sessionId, forKey: "reflect_session_id")
         var props: [String: Any] = ["session_count": sessionCount, "subsession_count": subsessionCount]
         if intervalMs >= 0 { props["last_interval_ms"] = intervalMs }   // gap since last activity (Unity parity)
-        emitJsonEvent("session_start", props, nil)
+        emitJsonEvent("session_start", props, nil, acceptedPermit: permit)
         if sessionCount > 1 {
-            DispatchQueue.global(qos: .utility).async { [weak self] in self?.attributionCheck() }
+            DispatchQueue.global(qos: .utility).async { [weak self] in self?.attributionCheck(permit: permit) }
+        }
         }
     }
 
-    private func bankActive() {
-        if sessionStartElapsed > 0 {
-            sessionActiveMs += max(0, monotonicMs() - sessionStartElapsed)
-            sessionStartElapsed = 0
-            UserDefaults.standard.set(Int(sessionActiveMs), forKey: "reflect_session_active_ms")
+    private func bankActive(_ permit: PrivacyTransportGate.Permit) {
+        sessionMutation(permit) {
+            if sessionStartElapsed > 0 {
+                sessionActiveMs += max(0, monotonicMs() - sessionStartElapsed)
+                sessionStartElapsed = 0
+                UserDefaults.standard.set(Int(sessionActiveMs), forKey: "reflect_session_active_ms")
+            }
         }
     }
 
     /// Foreground heartbeat (Unity parity): bank+persist the active stint WITHOUT
     /// stopping the timer, so a crash mid-foreground loses ≤30s of session length.
-    private func heartbeatBank() {
-        if sessionStartElapsed > 0 {
-            let now = monotonicMs()
-            sessionActiveMs += max(0, now - sessionStartElapsed)
-            sessionStartElapsed = now
-            UserDefaults.standard.set(Int(sessionActiveMs), forKey: "reflect_session_active_ms")
-            UserDefaults.standard.set(Int(nowMs()), forKey: "reflect_last_activity_wall")   // keep cross-kill anchor fresh
+    private func heartbeatBank(_ permit: PrivacyTransportGate.Permit) {
+        sessionMutation(permit) {
+            if sessionStartElapsed > 0 {
+                let now = monotonicMs()
+                sessionActiveMs += max(0, now - sessionStartElapsed)
+                sessionStartElapsed = now
+                UserDefaults.standard.set(Int(sessionActiveMs), forKey: "reflect_session_active_ms")
+                UserDefaults.standard.set(Int(nowMs()), forKey: "reflect_last_activity_wall")
+            }
         }
     }
-    private func startHeartbeat() {
-        stopHeartbeat()
-        let t = DispatchSource.makeTimerSource(queue: .main)
-        t.schedule(deadline: .now() + 30, repeating: 30)
-        t.setEventHandler { [weak self] in self?.heartbeatBank() }
-        heartbeatTimer = t
-        t.resume()
+    private func startHeartbeat(_ permit: PrivacyTransportGate.Permit) {
+        sessionMutation(permit) {
+            stopHeartbeat()
+            let t = DispatchSource.makeTimerSource(queue: .main)
+            t.schedule(deadline: .now() + 30, repeating: 30)
+            t.setEventHandler { [weak self] in self?.heartbeatBank(permit) }
+            heartbeatTimer = t
+            t.resume()
+        }
     }
     private func stopHeartbeat() { heartbeatTimer?.cancel(); heartbeatTimer = nil }
 
-    private func emitSessionEnd() {
-        bankActive()
-        emitJsonEvent("session_end",
-            ["session_length_ms": sessionActiveMs, "session_count": sessionCount, "subsession_count": subsessionCount], nil)
-        sessionOpen = false
-        sessionActiveMs = 0
-        let d = UserDefaults.standard
-        d.set(false, forKey: "reflect_session_open")
-        d.set(0, forKey: "reflect_session_active_ms")
+    private func emitSessionEnd(_ permit: PrivacyTransportGate.Permit) {
+        sessionMutation(permit) {
+            bankActive(permit)
+            emitJsonEvent("session_end",
+                ["session_length_ms": sessionActiveMs, "session_count": sessionCount, "subsession_count": subsessionCount],
+                nil, acceptedPermit: permit)
+            sessionOpen = false
+            sessionActiveMs = 0
+            let d = UserDefaults.standard
+            d.set(false, forKey: "reflect_session_open")
+            d.set(0, forKey: "reflect_session_active_ms")
+        }
     }
 
     /// If a prior process died with a session open, emit its banked length now.
-    private func recoverInterruptedSession(_ crossKillGapMs: Int64 = -1) {
+    private func recoverInterruptedSession(_ crossKillGapMs: Int64 = -1,
+                                           permit: PrivacyTransportGate.Permit) {
         // End the interrupted session ONLY if the cross-kill gap exceeded the threshold
         // (or is unknown). A within-threshold relaunch keeps it OPEN so onForeground
         // continues it as a subsession — no phantom extra session (Unity parity).
-        if sessionOpen && (crossKillGapMs < 0 || crossKillGapMs > Int64(sessionThresholdMs)) { emitSessionEnd() }
+        if sessionOpen && (crossKillGapMs < 0 || crossKillGapMs > Int64(sessionThresholdMs)) {
+            emitSessionEnd(permit)
+        }
     }
 
-    private func onForeground(_ crossKillGapMs: Int64 = -1) {
-        if !trackingEnabled { return }
+    private func onForeground(_ crossKillGapMs: Int64 = -1, permit: PrivacyTransportGate.Permit) {
+        sessionMutation(permit) {
         let now = monotonicMs()
         // gap=0 when never backgrounded this process (the launch foreground is a
         // continuation of the just-started session, not a 30-min-gap new one).
@@ -1964,9 +2861,9 @@ public class ReflectCore: NSObject {
         // Cold launch after a kill → use the persisted WALL-CLOCK gap (monotonic reset).
         let gap: Int64 = crossKillGapMs >= 0 ? crossKillGapMs : (hasPrior ? now - lastBackgroundElapsed : 0)
         if !sessionOpen {
-            startSession(intervalMs: (crossKillGapMs >= 0 || hasPrior) ? gap : -1)
+            startSession(intervalMs: (crossKillGapMs >= 0 || hasPrior) ? gap : -1, permit: permit)
         } else if gap > Int64(sessionThresholdMs) {
-            emitSessionEnd(); startSession(intervalMs: gap)
+            emitSessionEnd(permit); startSession(intervalMs: gap, permit: permit)
         } else if gap > ReflectCore.subsessionFloorMs {
             subsessionCount += 1
             UserDefaults.standard.set(Int(subsessionCount), forKey: "reflect_subsession_count")
@@ -1974,36 +2871,68 @@ public class ReflectCore: NSObject {
         } else {
             sessionStartElapsed = now
         }
-        startHeartbeat()   // periodically bank+persist foreground time (crash granularity)
+        startHeartbeat(permit)   // periodically bank+persist foreground time (crash granularity)
         UserDefaults.standard.set(Int(nowMs()), forKey: "reflect_last_activity_wall")   // refresh cross-kill anchor
-    }
-
-    private func onBackground() {
-        if !trackingEnabled { return }
-        stopHeartbeat()
-        bankActive()
-        lastBackgroundElapsed = monotonicMs()
-        UserDefaults.standard.set(Int(nowMs()), forKey: "reflect_last_activity_wall")   // cross-kill gap anchor
-    }
-
-    /// Enable/disable measurement (and opt back in after a forget-me). Mirrors Android.
-    private func setTrackingEnabled(_ enabled: Bool) {
-        if enabled == trackingEnabled { return }
-        if enabled {
-            trackingEnabled = true
-            UserDefaults.standard.removeObject(forKey: "reflect_suppressed")
-            if installUuid.isEmpty { installUuid = getOrCreateInstallUuid() }
-            registerConnectivityDrain()
-            queue.addOperation { [weak self] in self?.startSession() }
-            trackEventInternal(eventName: "app_open", propertiesJson: nil, referral: nil)
-        } else {
-            UserDefaults.standard.set(true, forKey: "reflect_suppressed")
-            queue.addOperation { [weak self] in
-                guard let self = self else { return }
-                if self.sessionOpen { self.emitSessionEnd() }   // final session_end before suppressing
-                self.trackingEnabled = false
-            }
         }
+    }
+
+    private func onBackground(_ permit: PrivacyTransportGate.Permit) {
+        sessionMutation(permit) {
+            stopHeartbeat()
+            bankActive(permit)
+            lastBackgroundElapsed = monotonicMs()
+            UserDefaults.standard.set(Int(nowMs()), forKey: "reflect_last_activity_wall")
+        }
+    }
+
+    /// Enable/disable measurement. Disable is synchronous and authoritative:
+    /// there is no final analytics event after the caller asks transport to stop.
+    private func setTrackingEnabled(_ enabled: Bool) -> Bool {
+        // Reopening before initialization could clear a durable suppression latch
+        // without a validated app configuration or initialized transport.
+        if enabled && !initialized { return false }
+        if enabled == trackingEnabled {
+            if enabled { return true }
+            transportGate.block()
+            let tombstonePersisted = privacyTombstone.update(trackingSuppressed: true)
+            UserDefaults.standard.set(true, forKey: "reflect_suppressed")
+            let defaultsPersisted = UserDefaults.standard.synchronize()
+            clearEventQueue()
+            sessionStateLock.lock()
+            sessionOpen = false
+            sessionStartElapsed = 0
+            stopHeartbeat()
+            UserDefaults.standard.set(false, forKey: "reflect_session_open")
+            sessionStateLock.unlock()
+            return tombstonePersisted || defaultsPersisted
+        }
+        if enabled {
+            UserDefaults.standard.removeObject(forKey: "reflect_suppressed")
+            guard UserDefaults.standard.synchronize() else { return false }
+            guard privacyTombstone.update(trackingSuppressed: false) else {
+                UserDefaults.standard.set(true, forKey: "reflect_suppressed")
+                _ = UserDefaults.standard.synchronize()
+                _ = privacyTombstone.update(trackingSuppressed: true)
+                return false
+            }
+            trackingEnabled = true
+            activateAfterPrivacyGate()
+        } else {
+            trackingEnabled = false
+            transportGate.block()
+            let tombstonePersisted = privacyTombstone.update(trackingSuppressed: true)
+            UserDefaults.standard.set(true, forKey: "reflect_suppressed")
+            let defaultsPersisted = UserDefaults.standard.synchronize()
+            clearEventQueue()
+            sessionStateLock.lock()
+            sessionOpen = false
+            sessionStartElapsed = 0
+            stopHeartbeat()
+            UserDefaults.standard.set(false, forKey: "reflect_session_open")
+            sessionStateLock.unlock()
+            guard tombstonePersisted || defaultsPersisted else { return false }
+        }
+        return true
     }
 
     /// Foreground/background observers drive both is_foreground and the session
@@ -2016,7 +2945,8 @@ public class ReflectCore: NSObject {
             self.isForegroundState = true
             self.refreshAttStatus()
             self.refreshIdfa()
-            self.queue.addOperation { self.onForeground() }   // session state on the serial queue
+            guard let permit = self.transportGate.permit() else { return }
+            self.queue.addOperation { self.onForeground(permit: permit) }   // session state on the serial queue
         }
         nc.addObserver(forName: UIApplication.willResignActiveNotification, object: nil, queue: .main) { [weak self] _ in
             self?.isForegroundState = false
@@ -2024,7 +2954,8 @@ public class ReflectCore: NSObject {
         nc.addObserver(forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: .main) { [weak self] _ in
             guard let self = self else { return }
             self.isForegroundState = false
-            self.queue.addOperation { self.onBackground() }
+            guard let permit = self.transportGate.permit() else { return }
+            self.queue.addOperation { self.onBackground(permit) }
         }
     }
 
