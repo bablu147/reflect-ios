@@ -437,6 +437,12 @@ enum PrivacyPersistence {
         "reflect_pending_deferred_dl", "reflect_coppa_tps_sent",
         "reflect_launch_url", "reflect_launch_url_expires_at_ms", "reflect_backoff_ms",
         "reflect_backoff_deadline",
+        // Automatic SKAdNetwork conversion-value state. MUST be cleared with the
+        // rest of the identity: a surviving revenue total would let an erased
+        // user's spend history set the conversion value of the NEXT install on
+        // this device, leaking their behaviour into someone else's postback.
+        "reflect_skan_revenue_total", "reflect_skan_last_fine",
+        "reflect_skan_cv_schema_json", "reflect_skan_cv_schema_at",
     ]
 
     static let allReflectKeys = identityKeys + [

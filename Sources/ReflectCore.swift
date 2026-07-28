@@ -52,6 +52,10 @@ public class ReflectCore: NSObject {
     private var appKey = ""
     private var companyKey: String?
     private var baseUrl = "https://api.reflect.cloud"
+
+    /// Automatic SKAdNetwork conversion-value state (revenue accumulator,
+    /// schema cache, monotonic send gate). See SkanAutoConversion.swift.
+    private let skanAuto = SkanAutoConversion()
     private var environment = "production"
     private var debug = false
     private var initialized = false
@@ -972,12 +976,14 @@ public class ReflectCore: NSObject {
         var props: [String: Any] = ["revenue_amount": amount, "revenue_currency": currency]
         if let type = args?["revenueType"] as? String { props["revenue_type"] = type }
         emitJsonEvent("revenue", props, top)
+        recordSkanRevenue(amount)
         result(nil)
     }
 
     private func handleTrackPurchase(args: [String: Any]?, result: ReflectResult) {
         if !initialized { result(nil); return }
         emitJsonEvent("purchase", purchaseProps(args), revenueTopLevel(args), deduplicationId: purchaseDedup(args))
+        recordSkanRevenue(args?["price"] as? Double ?? 0.0)
         result(nil)
     }
 
@@ -988,6 +994,7 @@ public class ReflectCore: NSObject {
         var props = purchaseProps(args)
         props["is_trial"] = args?["isTrial"] as? Bool ?? false
         emitJsonEvent("subscribe", props, top, deduplicationId: purchaseDedup(args))
+        recordSkanRevenue(args?["price"] as? Double ?? 0.0)
         result(nil)
     }
 
@@ -1024,6 +1031,75 @@ public class ReflectCore: NSObject {
     }
 
     /// Promoted top-level revenue columns shared by purchase/subscribe.
+    /// Feed post-install revenue into the automatic conversion value.
+    ///
+    /// Called from every revenue-bearing path (revenue / purchase / subscribe).
+    /// Apple only accepts an INCREASING fine value inside a measurement window
+    /// and each call can restart that window, so SkanAutoConversion suppresses
+    /// anything that would not raise the value — this may legitimately send
+    /// nothing.
+    ///
+    /// Fails silently and never throws: a conversion-value update must never
+    /// break revenue tracking itself, which is the money-bearing path.
+    private func recordSkanRevenue(_ amount: Double) {
+        guard amount.isFinite, amount > 0 else { return }
+        // Respect the same privacy posture as every other measurement write.
+        guard trackingEnabled, consentState != "denied",
+              !UserDefaults.standard.bool(forKey: "reflect_suppressed") else { return }
+
+        let total = skanAuto.addRevenue(amount)
+        refreshSkanSchemaIfStale()
+        guard let update = skanAuto.nextUpdate(nowRevenue: total) else { return }
+
+        handleUpdateConversionValue(
+            args: [
+                "fineValue": update.fineValue,
+                "coarseValue": update.coarse.rawValue,
+                "lockWindow": false,
+            ],
+            result: { [weak self] _ in
+                // Only remember it once Apple's API has been invoked, so a
+                // failed call is retried on the next purchase instead of being
+                // recorded as sent and suppressed forever.
+                self?.skanAuto.recordSent(fineValue: update.fineValue)
+            })
+    }
+
+    /// Fetch the operator's conversion-value schema (24h TTL). Without a schema
+    /// no value is ever sent — the SDK must not invent buckets the operator
+    /// never defined.
+    private func refreshSkanSchemaIfStale() {
+        let nowMs = Date().timeIntervalSince1970 * 1000
+        guard skanAuto.schemaIsStale(nowMs: nowMs) else { return }
+        guard !appKey.isEmpty,
+              let url = URL(string: "\(baseUrl)/skan/cv-schema?app_key=\(appKey)")
+        else { return }
+
+        var req = URLRequest(url: url)
+        req.httpMethod = "GET"
+        req.timeoutInterval = 10
+        URLSession.shared.dataTask(with: req) { [weak self] data, response, _ in
+            guard let self = self,
+                  let http = response as? HTTPURLResponse, http.statusCode == 200,
+                  let data = data,
+                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let mappings = obj["mappings"] ?? obj["schema_json"],
+                  let json = Self.schemaJsonString(mappings)
+            else { return }
+            // storeSchema rejects anything that does not parse, so a bad
+            // response cannot evict a good cached schema.
+            _ = self.skanAuto.storeSchema(json, nowMs: Date().timeIntervalSince1970 * 1000)
+        }.resume()
+    }
+
+    /// The endpoint may return the mappings as an array or as a JSON string;
+    /// normalise both to the string SkanAutoConversion caches.
+    private static func schemaJsonString(_ v: Any) -> String? {
+        if let s = v as? String { return s }
+        guard let d = try? JSONSerialization.data(withJSONObject: v) else { return nil }
+        return String(data: d, encoding: .utf8)
+    }
+
     private func revenueTopLevel(_ args: [String: Any]?) -> [String: Any] {
         var top: [String: Any] = [
             "revenue": args?["price"] as? Double ?? 0.0,
