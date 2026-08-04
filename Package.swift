@@ -22,6 +22,7 @@ let package = Package(
                 "Sources/ReflectCore.swift",
             ],
             sources: [
+                "Sources/AttTransportPolicy.swift",
                 "Sources/AttributionRetention.swift",
                 "Sources/PrivacyTransportState.swift",
                 "Tests/ReflectPrivacySupportTests/main.swift",

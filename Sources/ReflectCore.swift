@@ -46,8 +46,16 @@ public class ReflectCore: NSObject {
     // Raw install-referrer/AdServices values are memory-only and available just
     // long enough for the immediate online send.
     private static let transientAttributionTtlMs: Int64 = 30_000
+    // A batch refused by iOS tracking-domain policy is waiting on the ATT
+    // decision, not on the network. It still backs off — a host that never
+    // presents the prompt would otherwise be polled forever — but against a
+    // much lower ceiling than a server outage, because the wait is expected to
+    // end in seconds and the retries are what catch an answer the transition
+    // hook somehow misses. The decision itself (attTrackingDecisionResolved)
+    // is the real wake-up. See AttTransportPolicy.
+    private static let attBlockedMaxBackoffMs: Int64 = 300_000   // 5 min
 
-    private enum SendResult { case success, retry, drop, cancelled }
+    private enum SendResult { case success, retry, drop, cancelled, attBlocked }
 
     private var appKey = ""
     private var companyKey: String?
@@ -2042,6 +2050,26 @@ public class ReflectCore: NSObject {
                 releaseGuard = false
                 scheduleDrain(retryDelay)
                 return
+            case .attBlocked:
+                // Refused by tracking-domain policy: the events are intact and
+                // the gate opens on the user's ATT answer, not with time. Back
+                // off against the low ATT ceiling rather than the server-outage
+                // one, and — critically — persist NOTHING, so a relaunch that
+                // already carries the answer sends immediately instead of
+                // serving out a deadline earned behind the gate.
+                var parkDelay: Int64 = 0
+                guard transportGate.runIfValid(permit, {
+                    headRetryCount += 1
+                    drainBackoffMs = min(nextBackoff(drainBackoffMs, 0),
+                                         ReflectCore.attBlockedMaxBackoffMs)
+                    clearPersistedBackoff()
+                    parkDelay = drainBackoffMs
+                    nextSendAllowedMs = monotonicMs() + parkDelay
+                }) else { break }
+                endSending()
+                releaseGuard = false
+                scheduleDrain(parkDelay)
+                return
             case .cancelled:
                 break
             }
@@ -2124,10 +2152,24 @@ public class ReflectCore: NSObject {
         var responseRetryIn: Int64 = 0
         var responseContinueIn: Int64 = 0
         var responseCode = 0
+        // Snapshot the main-thread-owned ATT value here (still on the drain
+        // queue) rather than reading it from the URLSession callback.
+        let attSnapshot = cachedAttStatus
         let sem = DispatchSemaphore(value: 0)
         let task = URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
             defer { sem.signal() }
-            if error != nil { outcome = .retry; return }
+            if let error = error {
+                // An ingest host declared in NSPrivacyTrackingDomains is refused
+                // by iOS as "offline" until ATT is answered. That is a policy
+                // gate, not flakiness — classify it so drain() waits for the
+                // answer instead of burning persisted exponential backoff.
+                outcome = AttTransportPolicy.classify(
+                    errorDomain: (error as NSError).domain,
+                    errorCode: (error as NSError).code,
+                    attStatus: attSnapshot
+                ) == .attBlocked ? .attBlocked : .retry
+                return
+            }
             guard let http = response as? HTTPURLResponse else { outcome = .retry; return }
             let code = http.statusCode
             responseCode = code
@@ -2156,7 +2198,13 @@ public class ReflectCore: NSObject {
         guard transportGate.runIfValid(permit, {
             lastRetryAfterMs = responseRetryIn
             pendingContinueMs = responseContinueIn
-            log("Batch sent → \(responseCode) \(signed ? "(signed /event)" : "(/event/batch)") [n=\(events.count) batch=\(bid) retry=\(retryCount) q=\(queueSize)]"
+            // Name the ATT gate explicitly. It reports as a bare "offline"
+            // URLError, so without this the log reads as a generic network
+            // failure and sends the next person debugging it after the radio.
+            let status = outcome == .attBlocked
+                ? "BLOCKED (host in NSPrivacyTrackingDomains, ATT unanswered — parked for the prompt)"
+                : "→ \(responseCode)"
+            log("Batch sent \(status) \(signed ? "(signed /event)" : "(/event/batch)") [n=\(events.count) batch=\(bid) retry=\(retryCount) q=\(queueSize)]"
                 + (responseRetryIn > 0 ? " retry_in=\(responseRetryIn)ms" : "")
                 + (responseContinueIn > 0 ? " continue_in=\(responseContinueIn)ms" : ""))
         }) else { return .cancelled }
@@ -2818,6 +2866,7 @@ public class ReflectCore: NSObject {
     private func refreshAttStatus() {
         #if canImport(AppTrackingTransparency)
         if #available(iOS 14, *) {
+            let previous = cachedAttStatus
             switch ATTrackingManager.trackingAuthorizationStatus {
             case .authorized:    cachedAttStatus = "authorized"
             case .denied:        cachedAttStatus = "denied"
@@ -2825,8 +2874,33 @@ public class ReflectCore: NSObject {
             case .notDetermined: cachedAttStatus = "not_determined"
             @unknown default:    cachedAttStatus = "not_determined"
             }
+            // The ATT answer is the only event that lifts tracking-domain
+            // blocking, and it produces no NWPath transition — so unless it
+            // reopens transport here, a first-install batch that was refused
+            // behind the gate stays queued until the user relaunches. Every
+            // caller of refreshAttStatus (the prompt completion, auto-ATT at
+            // init, didBecomeActive, consent/ad-consent grants) routes through
+            // this one hook.
+            if AttTransportPolicy.isPromptResolution(previous: previous, current: cachedAttStatus) {
+                attTrackingDecisionResolved()
+            }
         }
         #endif
+    }
+
+    /// Reopen transport the moment the ATT prompt is answered.
+    ///
+    /// Clears only the gate that the blocked attempts installed. A grant lifts
+    /// the tracking-domain refusal outright; a denial does not, but it does end
+    /// the wait, so the queue returns to ordinary backoff instead of parking on
+    /// a decision that has already been made.
+    private func attTrackingDecisionResolved() {
+        guard initialized, trackingEnabled, consentState != "denied" else { return }
+        drainBackoffMs = 0
+        headRetryCount = 0
+        nextSendAllowedMs = 0
+        clearPersistedBackoff()
+        scheduleDrain(0)
     }
 
     private func nowMs() -> Int64 { return Int64(Date().timeIntervalSince1970 * 1000) }

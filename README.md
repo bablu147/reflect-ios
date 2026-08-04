@@ -73,6 +73,42 @@ Unity SDKs are thin bridges over `ReflectCore.handle(method:args:result:)` +
   type/partner/campaign. Upgrade cleanup removes legacy persisted ID and expiry keys
   immediately, including offline, and forces a signed full refresh.
 
+## ATT tracking-domain transport
+
+An app that lists its ingest host in `NSPrivacyTrackingDomains` has **every**
+connection to that host refused by iOS until the user answers the ATT prompt.
+The Unity SDK's build post-processor injects that entry automatically (see
+`reflect-sdk/Editor/ReflectBuildPostProcessor.cs`, `DefaultServerHost`), so this
+is the normal state of a shipped build, not an edge case.
+
+The refusal is delivered as `NSURLErrorNotConnectedToInternet` — the same code a
+device with no signal returns — and no `NWPath` transition ever accompanies it,
+because the network was reachable the whole time and only that one host was
+refused. Two consequences the core must handle, both encoded in
+`AttTransportPolicy` (pure, covered by `swift run reflect-privacy-tests`):
+
+- **A refusal while ATT is unanswered is not flakiness.** It is classified
+  `attBlocked` and backs off against a 5-minute ceiling instead of the
+  one-hour server-outage ceiling — it still backs off, so a host that never
+  presents the prompt is not polled forever. Nothing is persisted, so a
+  relaunch that already carries the answer sends immediately rather than
+  serving out a deadline earned behind the gate. Once ATT is answered, the same
+  error code returns to ordinary backoff.
+- **The ATT answer reopens transport.** `refreshAttStatus()` detects the
+  `not_determined` → decided transition and clears the send gate. Without it a
+  first-install batch stays queued until the user relaunches the app, which was
+  the observed symptom. Only a real observed transition counts — a first
+  observation of an already-answered prompt must not clear a legitimate
+  server-outage backoff that `restorePersistedBackoff()` carries across
+  restarts.
+
+A **denial** does not reopen the domain: declaring a host in
+`NSPrivacyTrackingDomains` means ATT-denying users cannot reach it at all, so
+their events are queued and eventually expire rather than delivered. That is a
+property of the declaration, not of this SDK. Operators who need analytics from
+ATT-denying users must split tracking traffic onto a declared host and keep
+ordinary first-party analytics on an undeclared one.
+
 The platform-independent gate and restart-cleanup race suite runs without an iOS
 simulator:
 

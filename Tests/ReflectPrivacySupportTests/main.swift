@@ -713,6 +713,107 @@ private func testEphemeralParameterSanitizationAndLegacyRestartCleanup() throws 
     )
 }
 
+/// Regression: a first-install batch refused by iOS tracking-domain policy was
+/// classified as ordinary network flakiness, so it burned exponential backoff
+/// (persisted as a wall-clock deadline) and nothing retried when the user
+/// answered the ATT prompt — the events shipped only on the next launch.
+private func testAttBlockedTransportIsNotTreatedAsNetworkFlakiness() throws {
+    // The exact refusal iOS delivers for a host in NSPrivacyTrackingDomains
+    // while the prompt is unanswered.
+    try check(
+        AttTransportPolicy.classify(
+            errorDomain: NSURLErrorDomain,
+            errorCode: NSURLErrorNotConnectedToInternet,
+            attStatus: "not_determined"
+        ) == .attBlocked,
+        "refusal behind an unanswered ATT prompt must not take the backoff path"
+    )
+
+    // A missing cached status is the pre-snapshot startup window, which is
+    // exactly when the install batch is sent. Treat it as undecided.
+    try check(
+        AttTransportPolicy.classify(
+            errorDomain: NSURLErrorDomain,
+            errorCode: NSURLErrorNotConnectedToInternet,
+            attStatus: nil
+        ) == .attBlocked,
+        "unknown ATT status must be treated as undecided, not as flakiness"
+    )
+
+    // Once the prompt is answered the gate is no longer an explanation, so a
+    // refusal is a real fault and must keep its exponential backoff.
+    for decided in ["authorized", "denied", "restricted"] {
+        try check(
+            AttTransportPolicy.classify(
+                errorDomain: NSURLErrorDomain,
+                errorCode: NSURLErrorNotConnectedToInternet,
+                attStatus: decided
+            ) == .retry,
+            "post-decision offline error must stay on ordinary backoff (\(decided))"
+        )
+    }
+
+    // Other transport faults are ordinary retries even while undecided —
+    // only the tracking-domain refusal code is special.
+    try check(
+        AttTransportPolicy.classify(
+            errorDomain: NSURLErrorDomain,
+            errorCode: NSURLErrorTimedOut,
+            attStatus: "not_determined"
+        ) == .retry,
+        "a timeout is flakiness, not a tracking-domain refusal"
+    )
+    try check(
+        AttTransportPolicy.classify(
+            errorDomain: "SomeOtherDomain",
+            errorCode: NSURLErrorNotConnectedToInternet,
+            attStatus: "not_determined"
+        ) == .retry,
+        "a matching code from a foreign error domain must not be claimed"
+    )
+}
+
+/// Regression: the ATT answer is the only signal that reopens a blocked
+/// tracking domain (no NWPath transition ever fires), but it must not be
+/// confused with merely observing an already-answered prompt at launch.
+private func testAttPromptResolutionFiresOnlyOnRealTransition() throws {
+    try check(
+        AttTransportPolicy.isPromptResolution(previous: "not_determined", current: "authorized"),
+        "granting the prompt must reopen transport"
+    )
+    // A denial does not unblock the domain, but it does end the wait — the
+    // queue must stop parking and return to ordinary backoff.
+    try check(
+        AttTransportPolicy.isPromptResolution(previous: "not_determined", current: "denied"),
+        "denying the prompt must still end the parked wait"
+    )
+    try check(
+        AttTransportPolicy.isPromptResolution(previous: "not_determined", current: "restricted"),
+        "a restricted decision must still end the parked wait"
+    )
+
+    // The load-bearing negative: every launch of an app whose user answered
+    // long ago starts with no cached value. Treating that first observation as
+    // a resolution would wipe the server-outage backoff that
+    // restorePersistedBackoff() exists to carry across restarts.
+    try check(
+        !AttTransportPolicy.isPromptResolution(previous: nil, current: "authorized"),
+        "first observation of an already-answered prompt must not clear backoff"
+    )
+    try check(
+        !AttTransportPolicy.isPromptResolution(previous: "authorized", current: "authorized"),
+        "an unchanged status must not re-kick transport"
+    )
+    try check(
+        !AttTransportPolicy.isPromptResolution(previous: "not_determined", current: "not_determined"),
+        "a still-unanswered prompt is not a resolution"
+    )
+    try check(
+        !AttTransportPolicy.isPromptResolution(previous: "not_determined", current: nil),
+        "losing the cached status is not a resolution"
+    )
+}
+
 do {
     try testBlockCancelsRegisteredWorkAndInvalidatesPermit()
     try testRegistrationVersusBlockRaceNeverLeavesLiveWork()
@@ -731,7 +832,9 @@ do {
     try testAttributionClickRetentionBoundaryAndScrub()
     try testRecursiveQueueRetentionAndExactSourceAge()
     try testEphemeralParameterSanitizationAndLegacyRestartCleanup()
-    print("Reflect iOS privacy transport tests: 17 passed (1,001 race iterations)")
+    try testAttBlockedTransportIsNotTreatedAsNetworkFlakiness()
+    try testAttPromptResolutionFiresOnlyOnRealTransition()
+    print("Reflect iOS privacy transport tests: 19 passed (1,001 race iterations)")
 } catch {
     fputs("Reflect iOS privacy transport tests FAILED: \(error)\n", stderr)
     exit(1)
