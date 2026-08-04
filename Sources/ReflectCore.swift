@@ -31,7 +31,7 @@ public class ReflectCore: NSObject {
     private static let channelName = "com.reflect.sdk/channel"
     private static let deepLinkChannelName = "com.reflect.sdk/deep_links"
     // Bump in lockstep with pubspec.yaml. Wire form: "flutter-<version>".
-    private static let sdkVersion = "flutter-1.7.0"
+    private static let sdkVersion = "flutter-1.7.1"
     private static let sessionGapMs = 30 * 60 * 1000   // new session after 30 min in bg
     private static let subsessionFloorMs: Int64 = 1000 // sub-second fg flips aren't subsessions
     // Durable event queue (Adjust-style): persist before send, drain head-first,
