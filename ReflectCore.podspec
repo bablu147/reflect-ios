@@ -1,6 +1,6 @@
 Pod::Spec.new do |s|
   s.name             = 'ReflectCore'
-  s.version          = '1.1.0'
+  s.version          = '1.1.1'
   s.summary          = 'Reflect MMP shared native iOS engine (wrapper-agnostic).'
   s.description      = <<-DESC
 The shared Reflect SDK engine for iOS — sessions, durable queue, HMAC signing,
@@ -12,7 +12,8 @@ surface. All SDK logic lives here; each platform ships only a thin bridge.
   s.homepage         = 'https://github.com/bablu147/reflect-ios'
   s.license          = { :type => 'MIT' }
   s.author           = { 'Reflect' => 'hello@reflect.cloud' }
-  # Published from the public repo. Tag the repo to match s.version (e.g. `1.1.0`).
+  # Published from the public repo. Tag the repo to match s.version EXACTLY
+  # (currently `1.1.1`). Never re-cut an existing tag — `1.1.0` is already public.
   # Consumers get it via `pod trunk push` (CocoaPods trunk) or, without trunk, a
   # Podfile line: pod 'ReflectCore', :git => 'https://github.com/bablu147/reflect-ios.git', :tag => '1.1.0'
   s.source           = { :git => 'https://github.com/bablu147/reflect-ios.git', :tag => s.version.to_s }
