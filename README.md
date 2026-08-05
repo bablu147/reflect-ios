@@ -118,11 +118,23 @@ swift run reflect-privacy-tests
 
 ## Use it (CocoaPods)
 
-> **Release gate:** the privacy implementation above is verified in source but is
-> not present in the published/tagged `1.0.0` core. Do not use `1.0.0` as the
-> Phase-0 privacy release. Publish an immutable artifact from this source and pass
-> clean CocoaPods consumer plus simulator/device gates before documenting a pod
-> coordinate here.
+> **Use `1.1.1` or newer.**
+>
+> - **`1.0.0`** predates the privacy implementation above (fail-closed posture,
+>   transport gate, 90-day click-context retention). Do not use it.
+> - **`1.1.0`** carries the privacy work but still hard-codes
+>   `X-Reflect-Platform: "flutter"`, so every event it sends — from Unity, React
+>   Native, Flutter or the native iOS SDK alike — is branded Flutter on the wire.
+> - **`1.1.1`** is the first tag with both. It is a behaviour fix with no API
+>   change, so the `~> 1.1` pins already used by the Flutter and React Native
+>   podspecs pick it up with no edit on their side.
+
+**Publishing checklist** (CocoaPods resolves `s.source` from a GitHub tag):
+1. Mirror this directory to `github.com/bablu147/reflect-ios` (it is a
+   subdirectory of the private monorepo; the public repo is the pod source).
+2. Tag `1.1.1` and push the tag — it must match `s.version` exactly.
+3. `pod spec lint ReflectCore.podspec` against the pushed tag.
+4. `1.1.0` is already public and may be in use — **never re-cut an existing tag.**
 
 ## License
 

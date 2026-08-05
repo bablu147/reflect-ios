@@ -32,6 +32,11 @@ public class ReflectCore: NSObject {
     private static let deepLinkChannelName = "com.reflect.sdk/deep_links"
     // Bump in lockstep with pubspec.yaml. Wire form: "flutter-<version>".
     private static let sdkVersion = "flutter-1.7.1"
+    // X-Reflect-Platform: the RUNTIME platform. Constant — this engine is the iOS
+    // build, so every host on it (Unity, Flutter, RN, native) is "ios". Matches the
+    // `platform IN ('android','ios')` vocabulary the schema uses everywhere else;
+    // the web SDK sends its own "web".
+    private static let platform = "ios"
     private static let sessionGapMs = 30 * 60 * 1000   // new session after 30 min in bg
     private static let subsessionFloorMs: Int64 = 1000 // sub-second fg flips aren't subsessions
     // Durable event queue (Adjust-style): persist before send, drain head-first,
@@ -2132,7 +2137,12 @@ public class ReflectCore: NSObject {
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue("flutter", forHTTPHeaderField: "X-Reflect-Platform")
+        // The RUNTIME platform, not the SDK flavour — this engine only ever runs on
+        // iOS, so it is a constant and hosts cannot override it. (It read "flutter"
+        // until 2026-08: a framework name in a platform field, which mis-reported
+        // every Unity/RN/native host as Flutter.) The flavour + version travel
+        // separately in X-Reflect-Sdk.
+        request.setValue(ReflectCore.platform, forHTTPHeaderField: "X-Reflect-Platform")
         request.setValue(hostSdkVersion, forHTTPHeaderField: "X-Reflect-Sdk")
         if gz != nil { request.setValue("gzip", forHTTPHeaderField: "Content-Encoding") }
         // SIGNED path (matches the Unity SDK): HMAC-SHA256 the WIRE body, POST to /event.
