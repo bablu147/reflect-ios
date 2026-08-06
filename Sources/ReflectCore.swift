@@ -45,6 +45,25 @@ public class ReflectCore: NSObject {
     private static let privacyTombstoneFileName = "reflect_privacy_suppression_v1.json"
     private static let maxQueue = 1000
     private static let batchSize = 50   // max events per HTTP request (Unity parity)
+    // Hard ceiling the ingest endpoint enforces (server: workers/src/lib/validation.ts,
+    // `LIMITS.eventsPerBatch`). A larger batch is rejected with a terminal 400
+    // bad_batch_shape, which the send path maps to .drop — so an over-large configured
+    // batch loses every event in it, then the next one, permanently and silently.
+    // Clamp the caller's value instead of honouring it.
+    private static let maxServerBatch = 200
+    // The other half of the same contract: the ingest endpoint reads at most
+    // `LIMITS.bodyBytes` WIRE bytes (post-gzip, since that is what we send) and 413s
+    // anything larger — terminal, so the batch is .drop'd and lost. The event COUNT
+    // ceiling above cannot prevent this on its own: 200 events with large props bags
+    // can exceed it.
+    //
+    // Deliberately 1% under the server's 1,000,000 rather than equal to it: the body
+    // we MEASURE and the body postBatch finally builds are not byte-identical
+    // (sent_at_ms advances between them, droppedCount can move), so a batch measured
+    // at exactly the ceiling could go out at ceiling+3 and 413 — the very outcome this
+    // guard exists to prevent. The slack costs nothing; the events it displaces ride
+    // the next batch.
+    private static let maxWireBytes = 990_000
     private static let baseBackoffMs: Int64 = 1000
     private static let maxBackoffMs: Int64 = 3_600_000
     private static let maxAskInRepolls = 3   // A3: bound server-driven attribution re-polls per session
@@ -749,7 +768,7 @@ public class ReflectCore: NSObject {
         linkMeEnabled = args?["linkMeEnabled"] as? Bool ?? false
         if let t = args?["sessionThresholdSeconds"] as? Int, t > 0 { sessionThresholdMs = t * 1000 }
         // Tuning knobs (Unity parity) — omit → constant default preserved.
-        if let b = args?["batchSize"] as? Int, b >= 1, b <= 1000 { cfgBatchSize = b }
+        if let b = args?["batchSize"] as? Int, b >= 1 { cfgBatchSize = min(b, ReflectCore.maxServerBatch) }
         if let q = args?["maxQueueSize"] as? Int, q > 0 { cfgMaxQueue = q }
         autoResolveDeferred = (args?["autoResolveDeferredDeepLink"] as? Bool) != false
         autoSessionTracking = (args?["autoSessionTracking"] as? Bool) != false
@@ -2002,15 +2021,26 @@ public class ReflectCore: NSObject {
             // parity — was one event per HTTP call).
             queueLock.lock()
             let n = min(cfgBatchSize, eventQueue.count)
-            let rawBatch = Array(eventQueue.prefix(n))
+            var rawBatch = Array(eventQueue.prefix(n))
             let immediateBatch = rawBatch.map { transientPayloadForImmediateSendLocked($0) }
             let qsize = eventQueue.count
             queueLock.unlock()
             // X2: re-stamp the LIVE consent/sharing/ATT onto each queued event just before
             // send (Adjust updatePackagesTrackingI) — a frozen-at-enqueue event otherwise
             // transmits a stale decision (e.g. an install built pre-ATT-grant).
-            let batchEvents = immediateBatch.map { restampConsent($0) }
+            var batchEvents = immediateBatch.map { restampConsent($0) }
             if batchEvents.isEmpty { break }
+            // Second half of the server's batch contract: the COUNT ceiling is clamped
+            // at config time, but bytes are only knowable here, after re-stamping.
+            // Trim rawBatch too — the success path below removes exactly
+            // rawBatch.count events, so shrinking only the payload would delete events
+            // that were never sent. The untrimmed tail stays queued for the next pass.
+            let fitting = wireFittingCount(batchEvents, headRetryCount, qsize)
+            if fitting < batchEvents.count {
+                log("Batch trimmed to wire limit [n=\(batchEvents.count) → \(fitting)]")
+                rawBatch = Array(rawBatch.prefix(fitting))
+                batchEvents = Array(batchEvents.prefix(fitting))
+            }
             switch postBatch(batchEvents, headRetryCount, qsize, permit) {
             case .success, .drop:
                 if !transportGate.isValid(permit) { break }
@@ -2228,6 +2258,48 @@ public class ReflectCore: NSObject {
         return "{\"app_key\":\"\(appKey)\",\"events\":[\(events.joined(separator: ","))],\"sent_at_ms\":\(nowMs())," +
                "\"sdk_telemetry\":{\"retry_count\":\(retryCount),\"queue_size\":\(queueSize),\"dropped\":\(droppedCount)}," +
                "\"batch_id\":\"\(bid)\"}"
+    }
+
+    /// Wire size of the batch exactly as `postBatch` would put it on the socket —
+    /// gzipped above the threshold, because the server's ceiling applies to the
+    /// compressed bytes it actually reads.
+    private func wireByteLength(_ events: [String], _ retryCount: Int, _ queueSize: Int) -> Int {
+        let raw = Data(buildBatchBody(events, retryCount, queueSize, batchId(events)).utf8)
+        if events.count >= 10, let gz = gzipBody(raw) { return gz.count }
+        return raw.count
+    }
+
+    /// How many events from the head of `events` fit under `maxWireBytes`.
+    ///
+    /// Without this, an over-size batch is a permanent silent outage exactly like the
+    /// over-size COUNT was: the server 413s it, a terminal 4xx maps to `.drop`, the
+    /// events are deleted, and the next flush rebuilds another too-large batch.
+    /// Halving rather than stepping down one at a time bounds this to ~8 rebuilds
+    /// even from a full 200-event batch.
+    ///
+    /// Returns at least 1. A single event that cannot fit alone is genuinely
+    /// undeliverable, and returning 0 would park it at the head of the queue for
+    /// ever — strictly worse than today. Sending it costs one wasted request, earns
+    /// the same 413/.drop it already gets, and lets the queue drain; the server-side
+    /// ingest counter is what makes that visible.
+    private func wireFittingCount(_ events: [String], _ retryCount: Int, _ queueSize: Int) -> Int {
+        // Fast path, and the one every healthy batch takes: if the UNCOMPRESSED body
+        // already fits then the wire body must too — gzip only shrinks at these
+        // sizes, and below the threshold the wire body IS the raw body. Skips
+        // compressing twice per send.
+        let rawSize = Data(buildBatchBody(events, retryCount, queueSize, batchId(events)).utf8).count
+        if rawSize <= ReflectCore.maxWireBytes { return events.count }
+
+        // Raw overflows, so compression decides. Re-measure for real: a batch that
+        // gzips 5-10x still sends in full, and only a genuinely huge one halves.
+        var n = events.count
+        while n > 1 {
+            if wireByteLength(Array(events.prefix(n)), retryCount, queueSize) <= ReflectCore.maxWireBytes {
+                return n
+            }
+            n /= 2
+        }
+        return 1
     }
 
     /// SHA-256 over the comma-joined, sorted event_ids; first 16 bytes hex (128-bit)
