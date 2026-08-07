@@ -31,7 +31,7 @@ public class ReflectCore: NSObject {
     private static let channelName = "com.reflect.sdk/channel"
     private static let deepLinkChannelName = "com.reflect.sdk/deep_links"
     // Bump in lockstep with pubspec.yaml. Wire form: "flutter-<version>".
-    private static let sdkVersion = "flutter-1.7.1"
+    private static let sdkVersion = "flutter-1.7.2"
     // X-Reflect-Platform: the RUNTIME platform. Constant — this engine is the iOS
     // build, so every host on it (Unity, Flutter, RN, native) is "ios". Matches the
     // `platform IN ('android','ios')` vocabulary the schema uses everywhere else;
