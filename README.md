@@ -118,7 +118,7 @@ swift run reflect-privacy-tests
 
 ## Use it (CocoaPods)
 
-> **Use `1.1.1` or newer.**
+> **Use `1.1.3` or newer.**
 >
 > - **`1.0.0`** predates the privacy implementation above (fail-closed posture,
 >   transport gate, 90-day click-context retention). Do not use it.
@@ -128,11 +128,17 @@ swift run reflect-privacy-tests
 > - **`1.1.1`** is the first tag with both. It is a behaviour fix with no API
 >   change, so the `~> 1.1` pins already used by the Flutter and React Native
 >   podspecs pick it up with no edit on their side.
+> - **`1.1.2`** adds the batch-size/byte clamps.
+> - **`1.1.3`** (2026-08-20) fixes `isJailbroken()` false-positiving on **all**
+>   real iPhones — production data showed every iOS attribution stamped
+>   `fraud_flag=device_rooted`. Behaviour fix, no API change; `~> 1.1` pins pick
+>   it up on the next `pod update`.
 
 **Publishing checklist** (CocoaPods resolves `s.source` from a GitHub tag):
 1. Mirror this directory to `github.com/bablu147/reflect-ios` (it is a
    subdirectory of the private monorepo; the public repo is the pod source).
-2. Tag `1.1.1` and push the tag — it must match `s.version` exactly.
+2. Tag the release and push the tag — it must match `s.version` exactly
+   (latest: `1.1.3`, published 2026-08-20).
 3. `pod spec lint ReflectCore.podspec` against the pushed tag.
 4. `1.1.0` is already public and may be in use — **never re-cut an existing tag.**
 
