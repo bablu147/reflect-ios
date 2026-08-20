@@ -2746,7 +2746,7 @@ public class ReflectCore: NSObject {
             "total_ram_mb": Int(ProcessInfo.processInfo.physicalMemory / (1024 * 1024)),
             "connection_type": connectionType(),      // were all missing on Flutter-iOS
             "vpn_detected": vpnDetected(),
-            "is_rooted": isJailbroken(),
+            "is_rooted": isJailbrokenCached,
             // Schema parity with Android (Unity emits these on iOS too): api_level = iOS
             // major version; mock_location_enabled is always false (no iOS mock-location API).
             "api_level": Int(snapSystemVersion.split(separator: ".").first.map(String.init) ?? "0") ?? 0,
@@ -2822,21 +2822,46 @@ public class ReflectCore: NSObject {
         #endif
     }
 
-    /// Jailbreak detection (ported from the Unity ReflectBridge IsJailbroken). */
-    private func isJailbroken() -> Bool {
+    /// Jailbreak detection (ported from the Unity ReflectBridge IsJailbroken).
+    /// Only jailbreak-SPECIFIC artifacts count as evidence. The previous
+    /// generation also probed `/bin/bash`, `/usr/sbin/sshd`, `/etc/apt` and
+    /// readability of the mobile user's `.GlobalPreferences.plist`; on recent
+    /// stock iOS those fire universally (production data 2026-08: 100% of real
+    /// iPhones reported `is_rooted=true`, stamping `fraud_flag=device_rooted`
+    /// on every iOS attribution), so ambiguous system paths are no longer
+    /// treated as evidence.
+    /// Computed once per process: the answer cannot change mid-process, and
+    /// re-running the write probe would cost one denied sandbox syscall per
+    /// tracked event. Lazy init is safe here — buildDevice() runs on the
+    /// SDK's serial queue, so first access is single-threaded.
+    private lazy var isJailbrokenCached: Bool = computeIsJailbroken()
+
+    private func computeIsJailbroken() -> Bool {
         #if targetEnvironment(simulator)
         return false
         #else
         let fm = FileManager.default
-        for p in ["/Applications/Cydia.app", "/Library/MobileSubstrate/MobileSubstrate.dylib",
-                  "/bin/bash", "/usr/sbin/sshd", "/etc/apt", "/private/var/lib/apt/"] {
+        // Rootful artifacts, plus the rootless bootstrap dir `/var/jb`:
+        // modern (Dopamine/palera1n-class) jailbreaks relocate there because
+        // the iOS 15+ root volume is a sealed SSV they cannot remount.
+        for p in ["/Applications/Cydia.app", "/Applications/Sileo.app",
+                  "/Applications/Zebra.app",
+                  "/Library/MobileSubstrate/MobileSubstrate.dylib",
+                  "/private/var/lib/apt/", "/var/jb"] {
             if fm.fileExists(atPath: p) { return true }
         }
-        // A sandboxed (non-jailbroken) app cannot open this file → jailbroken if it can.
-        if let f = fopen("/private/var/mobile/Library/Preferences/.GlobalPreferences.plist", "r") {
-            fclose(f); return true
+        // Sandbox-escape write probe — honest scope: on iOS 15+ the sealed
+        // root volume means this succeeds only on legacy ROOTFUL jailbreaks;
+        // rootless ones are covered by the /var/jb artifact above. A stock
+        // device fails here with a single denied syscall.
+        let probe = "/private/reflect_jb_\(UUID().uuidString).txt"
+        do {
+            try "1".write(toFile: probe, atomically: false, encoding: .utf8)
+            try? fm.removeItem(atPath: probe)
+            return true
+        } catch {
+            return false
         }
-        return false
         #endif
     }
 
