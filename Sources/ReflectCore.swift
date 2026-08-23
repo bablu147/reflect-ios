@@ -945,6 +945,9 @@ public class ReflectCore: NSObject {
             trackEventInternal(eventName: "app_first_open", propertiesJson: nil, referral: nil)
             if autoRegisterSkan { armSkan() }   // SKAdNetwork attribution timer at install (Unity parity)
             DispatchQueue.global(qos: .utility).async { [weak self] in self?.linkMeRecover() }
+            // docs/36: deliver the install batch now, with a fast retry ladder,
+            // instead of waiting for the next launch or the 30 s timer.
+            scheduleInstallDrainLadder()
         }
         if autoSessionTracking { trackEventInternal(eventName: "app_open", propertiesJson: nil, referral: nil) }
 
@@ -1594,6 +1597,9 @@ public class ReflectCore: NSObject {
             if autoResolveDeferred {
                 scheduleDeferredDeepLinkResolution()
             }
+            // docs/36: same fast first-launch delivery ladder as the init path —
+            // a consent-gated activation must also not wait for the next launch.
+            scheduleInstallDrainLadder()
         }
         if autoSessionTracking { trackEventInternal(eventName: "app_open", propertiesJson: nil, referral: nil) }
         scheduleAttributionCheck()
@@ -1977,6 +1983,22 @@ public class ReflectCore: NSObject {
         DispatchQueue.global(qos: .utility).asyncAfter(deadline: deadline) { [weak self] in
             self?.drain()
         }
+    }
+
+    /// Fast retry ladder for the first-launch install batch (docs/36). The
+    /// install must not ride only the ordinary 30 s periodic timer: on an iOS
+    /// cold start the first drain commonly loses the race against network
+    /// bring-up or app suspension, and the queued install then waits until the
+    /// next launch — measured live: two Kashew tests saw the install batch
+    /// enqueued at first launch but ingested only after the user reopened the
+    /// app (~174 s later). Extra rungs are harmless: drain() is single-flight
+    /// (beginSending) and the send gate (backoff / continue_in) still paces
+    /// every real retry, so this only shortens the FIRST delivery attempt.
+    private func scheduleInstallDrainLadder() {
+        scheduleDrain(0)
+        scheduleDrain(5_000)
+        scheduleDrain(15_000)
+        scheduleDrain(30_000)
     }
 
     private func beginSending() -> Bool {
@@ -3202,6 +3224,10 @@ public class ReflectCore: NSObject {
             self.isForegroundState = true
             self.refreshAttStatus()
             self.refreshIdfa()
+            // docs/36: flush the durable queue on every activation — an install
+            // whose cold-start drain lost the network race is delivered the
+            // moment the user returns to the app, without a full relaunch.
+            self.scheduleDrain(0)
             guard let permit = self.transportGate.permit() else { return }
             self.queue.addOperation { self.onForeground(permit: permit) }   // session state on the serial queue
         }

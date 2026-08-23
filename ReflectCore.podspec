@@ -1,6 +1,6 @@
 Pod::Spec.new do |s|
   s.name             = 'ReflectCore'
-  s.version          = '1.1.3'
+  s.version          = '1.1.4'
   s.summary          = 'Reflect MMP shared native iOS engine (wrapper-agnostic).'
   s.description      = <<-DESC
 The shared Reflect SDK engine for iOS — sessions, durable queue, HMAC signing,
