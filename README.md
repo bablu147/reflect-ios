@@ -129,7 +129,7 @@ swift run reflect-privacy-tests
 
 ## Use it (CocoaPods)
 
-> **Use `1.1.3` or newer.**
+> **Use `1.1.4` or newer.**
 >
 > - **`1.0.0`** predates the privacy implementation above (fail-closed posture,
 >   transport gate, 90-day click-context retention). Do not use it.
@@ -144,12 +144,18 @@ swift run reflect-privacy-tests
 >   real iPhones — production data showed every iOS attribution stamped
 >   `fraud_flag=device_rooted`. Behaviour fix, no API change; `~> 1.1` pins pick
 >   it up on the next `pod update`.
+> - **`1.1.4`** (2026-08-24) fixes first-session delivery: the install latches
+>   only at durable persistence (a dropped first launch re-fires, server-deduped
+>   per install_uuid), legacy-uuid adoption no longer silences unreported
+>   installs, swallowed drain wakeups replay, and a bounded background-task
+>   window flushes the queue when the app is backgrounded. Behaviour fix, no
+>   API change; `~> 1.1` picks it up on the next `pod update`.
 
 **Publishing checklist** (CocoaPods resolves `s.source` from a GitHub tag):
 1. Mirror this directory to `github.com/bablu147/reflect-ios` (it is a
    subdirectory of the private monorepo; the public repo is the pod source).
 2. Tag the release and push the tag — it must match `s.version` exactly
-   (latest: `1.1.3`, published 2026-08-20).
+   (latest: `1.1.4`, published 2026-08-24).
 3. `pod spec lint ReflectCore.podspec` against the pushed tag.
 4. `1.1.0` is already public and may be in use — **never re-cut an existing tag.**
 
