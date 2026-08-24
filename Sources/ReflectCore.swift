@@ -93,6 +93,10 @@ public class ReflectCore: NSObject {
     private var initialized = false
     private var installUuid = ""
     private var existingInstallUuid: String?   // legacy id to adopt on first migrated launch (Unity migration continuity)
+    // True when this process adopted a legacy wrapper uuid (D21): the install
+    // EVENT re-fires (server-deduped), but genuine-first-launch side effects
+    // (SKAN arming, LinkMe clipboard probe, deferred deep link) must not.
+    private var adoptedLegacyUuid = false
     private var hostSdkVersion: String = ReflectCore.sdkVersion   // brand for sdk_version + X-Reflect-Sdk; host-supplied ("react-native-x"/"unity-x"), defaults to the Flutter const
     private var userId: String?
     private var pushToken: String?
@@ -892,6 +896,7 @@ public class ReflectCore: NSObject {
         // unreported one is finally counted.
         if UserDefaults.standard.string(forKey: "reflect_install_uuid") == nil, let eu = existingInstallUuid {
             UserDefaults.standard.set(eu, forKey: "reflect_install_uuid")
+            adoptedLegacyUuid = true
         }
         installUuid = getOrCreateInstallUuid()
 
@@ -948,17 +953,22 @@ public class ReflectCore: NSObject {
         // First launch → fire app_install (AdServices token). Every launch → app_open.
         let firstLaunch = !defaults.bool(forKey: "reflect_install_reported")
         if firstLaunch {
-            trackEventInternal(eventName: "app_install", propertiesJson: nil, referral: adServicesReferral())
+            trackEventInternal(eventName: "app_install", propertiesJson: nil, referral: adServicesReferral(),
+                               latchInstallOnPersist: true)
             // Once-per-install, immediately after app_install (Unity/Firebase parity).
             trackEventInternal(eventName: "app_first_open", propertiesJson: nil, referral: nil)
             // docs/36: install_reported is latched inside trackEventInternal's op,
             // at the exact moment the install payload is durably persisted (see
-            // enqueue()'s return + the latch in the op) — never before, so a
-            // first-launch enqueue drop re-fires app_install on the next launch
-            // (server-deduped per install_uuid), and never in a separate op a
-            // privacy clear could race.
-            if autoRegisterSkan { armSkan() }   // SKAdNetwork attribution timer at install (Unity parity)
-            DispatchQueue.global(qos: .utility).async { [weak self] in self?.linkMeRecover() }
+            // enqueue()'s return + the gate-locked latch in the op) — never before,
+            // so a first-launch enqueue drop re-fires app_install on the next
+            // launch (server-deduped per install_uuid).
+            // Adopted-legacy devices re-fire ONLY the install (D21): SKAN arming,
+            // the clipboard LinkMe probe and deferred-deep-link resolution are
+            // genuine-first-launch side effects, not install re-reports.
+            if !adoptedLegacyUuid {
+                if autoRegisterSkan { armSkan() }   // SKAdNetwork attribution timer at install (Unity parity)
+                DispatchQueue.global(qos: .utility).async { [weak self] in self?.linkMeRecover() }
+            }
             // docs/36: deliver the install batch now, with a fast retry ladder,
             // instead of waiting for the next launch or the 30 s timer.
             scheduleInstallDrainLadder()
@@ -973,7 +983,7 @@ public class ReflectCore: NSObject {
         }
 
         if firstLaunch {
-            if autoResolveDeferred {
+            if autoResolveDeferred && !adoptedLegacyUuid {
                 scheduleDeferredDeepLinkResolution()
             }
         } else if autoResolveDeferred && defaults.bool(forKey: "reflect_pending_deferred_dl") {
@@ -1604,13 +1614,16 @@ public class ReflectCore: NSObject {
         let defaults = UserDefaults.standard
         let firstLaunch = !defaults.bool(forKey: "reflect_install_reported")
         if firstLaunch {
-            trackEventInternal(eventName: "app_install", propertiesJson: nil, referral: adServicesReferral())
+            trackEventInternal(eventName: "app_install", propertiesJson: nil, referral: adServicesReferral(),
+                               latchInstallOnPersist: true)
             trackEventInternal(eventName: "app_first_open", propertiesJson: nil, referral: nil)
             // install_reported latches inside the install op at durable persist —
-            // same path as handleInitialize (docs/36).
-            if autoRegisterSkan { armSkan() }
-            if autoResolveDeferred {
-                scheduleDeferredDeepLinkResolution()
+            // same path as handleInitialize (docs/36, D21).
+            if !adoptedLegacyUuid {
+                if autoRegisterSkan { armSkan() }
+                if autoResolveDeferred {
+                    scheduleDeferredDeepLinkResolution()
+                }
             }
             // docs/36: same fast first-launch delivery ladder as the init path —
             // a consent-gated activation must also not wait for the next launch.
@@ -1757,6 +1770,9 @@ public class ReflectCore: NSObject {
                                     topLevel: [String: Any]? = nil, callbackId: String? = nil,
                                     callbackParamsJson: String? = nil, partnerParamsJson: String? = nil,
                                     deduplicationId: String? = nil,
+                                    // D21: set ONLY by the SDK's own install flow — latching keys on
+                                    // provenance, never on an event-name string a host can also send.
+                                    latchInstallOnPersist: Bool = false,
                                     acceptedPermit: PrivacyTransportGate.Permit? = nil) {
         if !initialized || !trackingEnabled { return }   // forget-me / disable latch
         // Bind queued build work to the generation in which the API call was
@@ -1852,13 +1868,16 @@ public class ReflectCore: NSObject {
             if let data = try? JSONSerialization.data(withJSONObject: payload),
                let json = String(data: data, encoding: .utf8) {
                 let persisted = self.enqueue(json, permit: permit)
-                if persisted && eventName == "app_install" {
-                    // docs/36: latch install_reported at the moment the install is
-                    // DURABLY persisted — same serial op, same generation guards as
-                    // the event itself, so a privacy clear can never race a separate
-                    // latch op (it wipes this key and the queue file together, and
-                    // an op invalidated by the clear never reaches this line).
-                    UserDefaults.standard.set(true, forKey: "reflect_install_reported")
+                if persisted && latchInstallOnPersist {
+                    // D21: latch install_reported at the moment the install is
+                    // DURABLY persisted — and set it under the SAME gate lock
+                    // block() takes, so a consent-denial / disable / delete that
+                    // wiped the queue can never be trailed by a resurrected latch:
+                    // either this write lands before the transition (and the clear
+                    // then erases it) or the invalidated permit drops it.
+                    _ = self.transportGate.runIfValid(permit, {
+                        UserDefaults.standard.set(true, forKey: "reflect_install_reported")
+                    })
                 }
             }
         }
@@ -1892,10 +1911,13 @@ public class ReflectCore: NSObject {
     }
 
     /// Caller MUST hold queueLock.
-    private func persistQueueLocked() {
-        guard let url = queueFileURL() else { return }
+    /// Returns true only when the queue file durably landed on disk.
+    @discardableResult
+    private func persistQueueLocked() -> Bool {
+        guard let url = queueFileURL() else { return false }
         let text = eventQueue.joined(separator: "\n")
-        try? text.write(to: url, atomically: true, encoding: .utf8)
+        do { try text.write(to: url, atomically: true, encoding: .utf8); return true }
+        catch { return false }
     }
 
     /// Caller MUST hold queueLock. Removes expired click context from legacy
@@ -1986,7 +2008,7 @@ public class ReflectCore: NSObject {
                 expiresAtMs: nowMs() + ReflectCore.transientAttributionTtlMs
             )
         }
-        persistQueueLocked()
+        let durable = persistQueueLocked()
         queueLock.unlock()
         if let transientEventId {
             DispatchQueue.global(qos: .utility).asyncAfter(
@@ -2002,7 +2024,10 @@ public class ReflectCore: NSObject {
             }
         }
         scheduleDrain(0)
-        return true
+        // The event stays queued in memory either way; only the caller's latch
+        // decision keys on durability (D21) — a failed disk write must not
+        // pretend the install is safe across a process death.
+        return durable
     }
 
     private func scheduleDrain(_ delayMs: Int64) {
