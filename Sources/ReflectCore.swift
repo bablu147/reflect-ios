@@ -324,6 +324,9 @@ public class ReflectCore: NSObject {
     private lazy var pendingPrivacyDelete = PendingPrivacyDeleteStore(defaults: .standard)
     private lazy var privacyTombstone = PrivacySuppressionTombstone(url: privacyTombstoneFileURL())
     private var sending = false
+    // Set when a drain wakeup loses the single-flight race; replayed by
+    // endSending() so the wakeup is deferred, never dropped.
+    private var drainRequested = false
     private var offlineMode = false   // setOfflineMode(true): keep tracking + queuing, but pause sending
     private var localOnly = false     // empty baseUrl ⇒ local DEBUG mode (Unity parity): collect, NEVER network
     private var flushIntervalMs: Int64 = 30_000   // periodic-flush backstop cadence (Unity FlushIntervalSeconds)
@@ -878,11 +881,17 @@ public class ReflectCore: NSObject {
         }
         transportGate.allow()
         // Adopt a legacy install identity BEFORE minting one, so an upgrade from a
-        // wrapper's old store keeps the same install_uuid (+ doesn't re-fire app_install
-        // — a legacy install with a uuid already reported it).
+        // wrapper's old store keeps the same install_uuid. Deliberately do NOT set
+        // reflect_install_reported here: assuming "a legacy uuid already reported
+        // its install" silenced every device whose legacy install never reached the
+        // server (docs/36 C3 — 79 of ~102 live Kashew iOS devices had event streams
+        // but no install row). The firstLaunch branch below fires app_install with
+        // the ADOPTED uuid instead; the server dedups installs per install_uuid
+        // (fraud_flag=duplicate_install, attribution skipped), so a genuinely
+        // reported legacy install costs one flagged duplicate row while an
+        // unreported one is finally counted.
         if UserDefaults.standard.string(forKey: "reflect_install_uuid") == nil, let eu = existingInstallUuid {
             UserDefaults.standard.set(eu, forKey: "reflect_install_uuid")
-            UserDefaults.standard.set(true, forKey: "reflect_install_reported")
         }
         installUuid = getOrCreateInstallUuid()
 
@@ -939,10 +948,15 @@ public class ReflectCore: NSObject {
         // First launch → fire app_install (AdServices token). Every launch → app_open.
         let firstLaunch = !defaults.bool(forKey: "reflect_install_reported")
         if firstLaunch {
-            defaults.set(true, forKey: "reflect_install_reported")
             trackEventInternal(eventName: "app_install", propertiesJson: nil, referral: adServicesReferral())
             // Once-per-install, immediately after app_install (Unity/Firebase parity).
             trackEventInternal(eventName: "app_first_open", propertiesJson: nil, referral: nil)
+            // docs/36: install_reported is latched inside trackEventInternal's op,
+            // at the exact moment the install payload is durably persisted (see
+            // enqueue()'s return + the latch in the op) — never before, so a
+            // first-launch enqueue drop re-fires app_install on the next launch
+            // (server-deduped per install_uuid), and never in a separate op a
+            // privacy clear could race.
             if autoRegisterSkan { armSkan() }   // SKAdNetwork attribution timer at install (Unity parity)
             DispatchQueue.global(qos: .utility).async { [weak self] in self?.linkMeRecover() }
             // docs/36: deliver the install batch now, with a fast retry ladder,
@@ -1590,9 +1604,10 @@ public class ReflectCore: NSObject {
         let defaults = UserDefaults.standard
         let firstLaunch = !defaults.bool(forKey: "reflect_install_reported")
         if firstLaunch {
-            defaults.set(true, forKey: "reflect_install_reported")
             trackEventInternal(eventName: "app_install", propertiesJson: nil, referral: adServicesReferral())
             trackEventInternal(eventName: "app_first_open", propertiesJson: nil, referral: nil)
+            // install_reported latches inside the install op at durable persist —
+            // same path as handleInitialize (docs/36).
             if autoRegisterSkan { armSkan() }
             if autoResolveDeferred {
                 scheduleDeferredDeepLinkResolution()
@@ -1836,7 +1851,15 @@ public class ReflectCore: NSObject {
 
             if let data = try? JSONSerialization.data(withJSONObject: payload),
                let json = String(data: data, encoding: .utf8) {
-                self.enqueue(json, permit: permit)
+                let persisted = self.enqueue(json, permit: permit)
+                if persisted && eventName == "app_install" {
+                    // docs/36: latch install_reported at the moment the install is
+                    // DURABLY persisted — same serial op, same generation guards as
+                    // the event itself, so a privacy clear can never race a separate
+                    // latch op (it wipes this key and the queue file together, and
+                    // an op invalidated by the clear never reaches this line).
+                    UserDefaults.standard.set(true, forKey: "reflect_install_reported")
+                }
             }
         }
     }
@@ -1933,14 +1956,17 @@ public class ReflectCore: NSObject {
         return false
     }
 
-    private func enqueue(_ payload: String, permit: PrivacyTransportGate.Permit) {
-        guard trackingEnabled, consentState != "denied", transportGate.isValid(permit) else { return }
-        guard let retentionSafePayload = AttributionRetention.scrubQueuedEvent(payload) else { return }
+    /// Returns true only when the payload was appended AND durably persisted —
+    /// the caller latches install_reported on exactly that condition (docs/36).
+    @discardableResult
+    private func enqueue(_ payload: String, permit: PrivacyTransportGate.Permit) -> Bool {
+        guard trackingEnabled, consentState != "denied", transportGate.isValid(permit) else { return false }
+        guard let retentionSafePayload = AttributionRetention.scrubQueuedEvent(payload) else { return false }
         var transientEventId: String?
         queueLock.lock()
         guard trackingEnabled, consentState != "denied", transportGate.isValid(permit) else {
             queueLock.unlock()
-            return
+            return false
         }
         scrubQueueLocked()
         // Overflow → drop the NEWEST (this event) instead of the oldest, so the
@@ -1949,7 +1975,7 @@ public class ReflectCore: NSObject {
         if eventQueue.count >= cfgMaxQueue {
             droppedCount += 1
             queueLock.unlock()
-            return
+            return false
         }
         eventQueue.append(retentionSafePayload)
         if AttributionRetention.hasTransientAttributionContext(payload),
@@ -1976,6 +2002,7 @@ public class ReflectCore: NSObject {
             }
         }
         scheduleDrain(0)
+        return true
     }
 
     private func scheduleDrain(_ delayMs: Int64) {
@@ -2003,11 +2030,34 @@ public class ReflectCore: NSObject {
 
     private func beginSending() -> Bool {
         sendLock.lock(); defer { sendLock.unlock() }
-        if sending { return false }
+        if sending {
+            // A wakeup that loses the single-flight race must not be dropped:
+            // the in-flight drain snapshotted the queue BEFORE this caller's
+            // event was enqueued, and if its batch fails it returns without
+            // rescheduling for the newcomer. Remember the request and replay it
+            // when the in-flight drain releases the lock. (Measured live on
+            // Kashew iOS: the first-session install wakeups were swallowed
+            // behind session_start's failing 15 s send.)
+            drainRequested = true
+            return false
+        }
         sending = true
         return true
     }
-    private func endSending() { sendLock.lock(); sending = false; sendLock.unlock() }
+    private func endSending() {
+        sendLock.lock()
+        sending = false
+        let replay = drainRequested
+        drainRequested = false
+        sendLock.unlock()
+        // Re-enter through the normal path: drain() self-gates on backoff /
+        // consent / offline, so the replay can never bypass a send gate.
+        if replay { scheduleDrain(0); return }
+        // Nothing left and no replay requested → hand any background-flush
+        // assertion back to the system now instead of at the 25 s cap.
+        queueLock.lock(); let empty = eventQueue.isEmpty; queueLock.unlock()
+        if empty { endBackgroundFlushWindow() }
+    }
 
     // Runs on a background dispatch queue (via scheduleDrain), decoupled from the
     // event-build OperationQueue. beginSending() keeps exactly one in flight.
@@ -3214,6 +3264,61 @@ public class ReflectCore: NSObject {
         return true
     }
 
+    // MARK: - Background flush window
+
+    private let bgTaskLock = NSLock()
+    private var bgTask: UIBackgroundTaskIdentifier = .invalid
+    private var bgGeneration: UInt64 = 0   // identity for the timed release, so a
+                                           // stale 25 s timer can't kill a newer window
+
+    /// Keep the process alive long enough to deliver what is already queued when
+    /// the app leaves the foreground. Without this, every retry/timer in this
+    /// process freezes the moment iOS suspends it and the durable queue waits
+    /// for the NEXT launch (measured live: 6 of 21 late Kashew first sessions
+    /// ended within ~40 ms of the install being enqueued). Bounded: released
+    /// early by endSending() once the queue drains, on reactivation, on
+    /// expiration, or by a generation-checked 25 s cap (under the ~30 s grant).
+    /// No-op when nothing is queued/in flight or when drain() could not send
+    /// anyway (offline/local/consent-gated) — an assertion that provably cannot
+    /// deliver would only burn the system's background budget.
+    /// NOTE: UIApplication.shared is extension-unavailable at compile time; the
+    /// podspec pins APPLICATION_EXTENSION_API_ONLY=NO so extension consumers
+    /// still build, and these paths only run off UIApplication lifecycle
+    /// notifications, which never fire in an extension process.
+    private func beginBackgroundFlushWindow() {
+        guard initialized, trackingEnabled, !offlineMode, !localOnly,
+              consentState != "denied", transportGate.permit() != nil else { return }
+        queueLock.lock(); let hasEvents = !eventQueue.isEmpty; queueLock.unlock()
+        sendLock.lock(); let inFlight = sending; sendLock.unlock()
+        guard hasEvents || inFlight else { return }
+        bgTaskLock.lock()
+        if bgTask != .invalid { bgTaskLock.unlock(); scheduleDrain(0); return }
+        bgGeneration &+= 1
+        let gen = bgGeneration
+        let task = UIApplication.shared.beginBackgroundTask(withName: "ReflectFlush") { [weak self] in
+            self?.endBackgroundFlushWindow()
+        }
+        bgTask = task
+        bgTaskLock.unlock()
+        guard task != .invalid else { return }
+        scheduleDrain(0)
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 25) { [weak self] in
+            self?.endBackgroundFlushWindow(ifGeneration: gen)
+        }
+    }
+
+    /// Pass `ifGeneration` from the timed release only: it no-ops when a newer
+    /// window has since been opened. Unconditional callers (reactivation, the
+    /// expiration handler, endSending's drained-queue release) omit it.
+    private func endBackgroundFlushWindow(ifGeneration gen: UInt64? = nil) {
+        bgTaskLock.lock()
+        if let gen, gen != bgGeneration { bgTaskLock.unlock(); return }
+        let task = bgTask
+        bgTask = .invalid
+        bgTaskLock.unlock()
+        if task != .invalid { UIApplication.shared.endBackgroundTask(task) }
+    }
+
     /// Foreground/background observers drive both is_foreground and the session
     /// manager. ATT status is refreshed on each activation (it changes after the
     /// ATT prompt). Observers registered once at init on the main thread.
@@ -3222,6 +3327,7 @@ public class ReflectCore: NSObject {
         nc.addObserver(forName: UIApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in
             guard let self = self else { return }
             self.isForegroundState = true
+            self.endBackgroundFlushWindow()
             self.refreshAttStatus()
             self.refreshIdfa()
             // docs/36: flush the durable queue on every activation — an install
@@ -3237,6 +3343,7 @@ public class ReflectCore: NSObject {
         nc.addObserver(forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: .main) { [weak self] _ in
             guard let self = self else { return }
             self.isForegroundState = false
+            self.beginBackgroundFlushWindow()
             guard let permit = self.transportGate.permit() else { return }
             self.queue.addOperation { self.onBackground(permit) }
         }

@@ -23,6 +23,12 @@ surface. All SDK logic lives here; each platform ships only a thin bridge.
   s.swift_version    = '5.0'
 
   s.frameworks       = 'UIKit', 'AdSupport', 'StoreKit', 'CoreTelephony'
+  # The background-flush window uses UIApplication.shared/beginBackgroundTask,
+  # which are extension-unavailable at COMPILE time. Pin the flag off so a host
+  # that links this pod into an app extension still builds; those code paths run
+  # only off UIApplication lifecycle notifications, which never fire in an
+  # extension process, so they are unreachable there at runtime.
+  s.pod_target_xcconfig = { 'APPLICATION_EXTENSION_API_ONLY' => 'NO' }
   # Weak-linked: present only on newer OSes (ATT iOS 14+, AdServices 14.3+).
   s.weak_frameworks  = 'AppTrackingTransparency', 'AdServices'
 

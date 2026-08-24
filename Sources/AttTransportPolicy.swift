@@ -5,8 +5,10 @@ import Foundation
 ///
 /// WHY THIS EXISTS
 /// ---------------
-/// An app that lists its ingest host in `NSPrivacyTrackingDomains` — which an
-/// MMP host must, since the SDK declares `NSPrivacyTracking` true — has EVERY
+/// An app that lists its ingest host in `NSPrivacyTrackingDomains` — an OPT-IN
+/// posture since 2026-08 (see ReflectBuildPostProcessor.DeclareTrackingDomain;
+/// default builds leave the host undeclared precisely because the declaration
+/// silences ATT-undecided/denying users entirely) — has EVERY
 /// connection to that host refused by iOS until the user resolves the ATT
 /// prompt. The refusal arrives as a plain `NSURLErrorNotConnectedToInternet`,
 /// indistinguishable at the URLSession layer from a device with no signal.

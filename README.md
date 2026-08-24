@@ -75,11 +75,19 @@ Unity SDKs are thin bridges over `ReflectCore.handle(method:args:result:)` +
 
 ## ATT tracking-domain transport
 
-An app that lists its ingest host in `NSPrivacyTrackingDomains` has **every**
-connection to that host refused by iOS until the user answers the ATT prompt.
-The Unity SDK's build post-processor injects that entry automatically (see
-`reflect-sdk/Editor/ReflectBuildPostProcessor.cs`, `DefaultServerHost`), so this
-is the normal state of a shipped build, not an edge case.
+**The ingest host is NOT declared in `NSPrivacyTrackingDomains` by default.**
+Declaring it means iOS refuses **every** connection to that host until the user
+answers the ATT prompt — ATT-undecided *and* ATT-denying users then deliver
+nothing at all (measured live 2026-08 on a production fleet: only ~32% of
+active iOS devices — roughly the ATT accept rate — ever delivered an SDK
+event). Identifier collection needs no such fence: iOS itself returns an
+all-zero IDFA until ATT is authorized. The Unity build post-processor therefore
+injects the entry only when the integrator opts in
+(`ReflectBuildPostProcessor.DeclareTrackingDomain` /
+`REFLECT_DECLARE_TRACKING_DOMAIN=1`); hosts on the other wrappers make the same
+choice in their own app manifest. Everything below describes the transport
+behavior **when a host opts into the declaration** (or declares the domain
+itself):
 
 The refusal is delivered as `NSURLErrorNotConnectedToInternet` — the same code a
 device with no signal returns — and no `NWPath` transition ever accompanies it,
@@ -105,9 +113,12 @@ refused. Two consequences the core must handle, both encoded in
 A **denial** does not reopen the domain: declaring a host in
 `NSPrivacyTrackingDomains` means ATT-denying users cannot reach it at all, so
 their events are queued and eventually expire rather than delivered. That is a
-property of the declaration, not of this SDK. Operators who need analytics from
-ATT-denying users must split tracking traffic onto a declared host and keep
-ordinary first-party analytics on an undeclared one.
+property of the declaration, not of this SDK — and it is exactly why the
+default posture is now *undeclared* (the Adjust pattern: only a dedicated
+consent host is declared; the analytics host is not). Operators who opt into
+the declaration accept losing ATT-undecided/denying users, or split tracking
+traffic onto a declared host and keep first-party analytics on an undeclared
+one.
 
 The platform-independent gate and restart-cleanup race suite runs without an iOS
 simulator:
